@@ -1,8 +1,8 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         M-Team 女优身高标注 + 列表大图
 // @namespace    mteam
-// @version      1.3.0
-// @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面。身高数据内嵌，无需联网。
+// @version      1.8.0
+// @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
 // @match        https://*.m-team.cc/*
@@ -50,12 +50,66 @@ const TARGET_SELECTORS = [
 // 是否启用身高标注（可在面板中切换）
 const ENABLED_KEY = 'mt_height_enabled';
 
+/* ---- 现场排障开关（默认全开，普通用户用不到）----
+ * 卡顿时想确定是哪个功能引起的，控制台执行下面任意几条后刷新即可：
+ *   localStorage.mt_off = 'title'        只关「种子名完整显示」
+ *   localStorage.mt_off = 'thumb'        只关「缩略图缩放」
+ *   localStorage.mt_off = 'badge'        只关「身高标签」
+ *   localStorage.mt_off = 'title,thumb'  关多个
+ *   localStorage.mt_off = 'all'          一次关掉全部（用来判断卡顿是不是我们引起的）
+ * 恢复：localStorage.removeItem('mt_off')
+ */
+const FEATURE_OFF = (function () {
+    const set = Object.create(null);
+    let raw = '';
+    try { raw = String(localStorage.getItem('mt_off') || ''); } catch (e) { raw = ''; }
+    raw.split(',').forEach((k) => {
+        const t = k.trim();
+        if (t === 'all') { set.title = set.thumb = set.badge = 1; return; }
+        if (t) set[t] = 1;
+    });
+    return set;
+})();
+
 // ---- 列表大图：缩略图尺寸（短边像素） ----
 const THUMB_SIZES = [240, 360, 480];
 const THUMB_SIZE_KEY = 'mt_big_thumb_size';
 
 // ---- 收藏：保存的页面列表 ----
 const FAV_KEY = 'mt_fav_list';
+
+// ---- 订阅：M-Team「女优展示（showcase）」收藏列表 ----
+// 唯一来源：用户自己打开 /showcase?action=fav 订阅页并点「已订阅」按钮时，
+// 从页面卡片 DOM 读取名字。脚本不主动监测、不发任何接口请求，避免 CORS / 403 报错与卡顿。
+const SUB_KEY = 'mt_subscribed_actresses';  // 缓存 { ts, names: [...], total, source }
+const SUB_BADGE_TEXT = '已订阅';
+// 女优卡片链接：站点改版换过详情页路径，多留几套，命中哪套用哪套
+const SUB_DOM_SELECTORS = [
+    'a[href*="/showcaseDetail"]',
+    'a[href*="/showcase/"]',
+    'a[href*="/actress"]',
+    'a[href*="/star"]',
+];
+// 页面上这些文字不是女优名，别混进订阅名单
+const SUB_UI_WORDS = /^(首页|我的|收藏|已订阅|全部|更多|加载中|加载更多|搜索|登录|注册|订阅|取消订阅|返回|上一页|下一页|没有更多了?)$/;
+
+/* ============================================================
+ * 自检：本文件是「模板」，核心逻辑与身高数据由 tools/build-userscript.mjs 注入。
+ * 直接安装模板会缺少 buildAutomaton / normalizeStr 等函数，导致整脚本 ReferenceError。
+ * 这里提前拦住，给出可读提示，避免页面上一堆 "xxx is not defined"。
+ * ============================================================ */
+if (typeof buildAutomaton !== 'function' || typeof normalizeStr !== 'function') {
+    try {
+        // eslint-disable-next-line no-console
+        console.error(
+            '[M-Team 女优身高标注] 安装的是未构建的模板（缺少核心逻辑/数据）。\n' +
+            '请安装 dist/m-team-actress-height.user.js，而不是 src/userscript.template.js。',
+        );
+    } catch (e) {
+        /* ignore */
+    }
+    return;
+}
 
 /* ============================================================
  * 内嵌数据集：{ 女优名: 身高(cm) }
@@ -86,6 +140,373 @@ for (const _name in ACTRESS_HEIGHT) {
 const AC = buildAutomaton(_patterns);
 
 /* ============================================================
+ * 订阅：M-Team「女优展示（showcase）」收藏
+ * ------------------------------------------------------------
+ * 唯一来源是订阅页（showcase?action=fav）的卡片 DOM：用户打开订阅页、
+ * 点一下面板上的「已订阅」按钮，脚本才去读一次并缓存。
+ * 脚本自身不发任何网络请求（不请求 /api、不 hook 页面 fetch/XHR），
+ * 因此不会产生 CORS / 403 报错，也不会有后台轮询带来的卡顿。
+ *
+ * 拿到名字后单独建一台 Aho-Corasick，与身高标注各走各的：
+ * 即使某个女优还没有身高数据，只要在订阅列表里，标题照样能被识别并加「已订阅」标签。
+ * ============================================================ */
+let subNames = [];       // 订阅女优的原始名字（用于匹配）
+let subCount = 0;        // 订阅条目数（面板上显示的数量）
+let subPatterns = [];    // 归一化后的匹配模式
+let SUB_AC = null;       // 订阅女优自动机（无订阅时为 null）
+let subVersion = 0;      // 集合版本：变化后强制重扫已标注元素
+let subEngineError = '';  // 订阅匹配引擎自身的异常（如核心函数缺失）
+let subDomWarned = false; // 收藏页读不到卡片时的结构诊断，也只打一次
+
+// 去掉括号补充说明（「三上悠亜（みかみゆあ）」→「三上悠亜」）并做全角→半角归一化
+function subNormalizeName(name) {
+    return normalizeStr(String(name))
+        .replace(/[（(][^）)]*[）)]/g, '')
+        .trim();
+}
+
+// 由订阅名字生成匹配模式：原名 + 去空白版本（标题里常写「三上悠亜」而数据里是「三上 悠亜」）
+function buildSubPatterns(names) {
+    const out = [];
+    const seen = new Set();
+    const push = (s) => {
+        if (!s || s.length < 2 || seen.has(s)) return;
+        seen.add(s);
+        out.push(s);
+    };
+    for (const raw of names) {
+        const base = subNormalizeName(raw);
+        if (!base) continue;
+        push(base);
+        const compact = base.replace(/[\s\u3000]+/g, '');
+        if (compact.length >= 3 && compact !== base) push(compact);
+    }
+    return out;
+}
+
+// 应用一份订阅名单；返回是否真的发生变化
+function applySubNames(names) {
+    const list = Array.isArray(names)
+        ? names.filter((n) => typeof n === 'string' && n.trim())
+        : [];
+    const patterns = buildSubPatterns(list).sort();
+    const changed =
+        patterns.length !== subPatterns.length ||
+        patterns.some((p, i) => p !== subPatterns[i]);
+    subNames = list;
+    if (changed) {
+        subPatterns = patterns;
+        SUB_AC = buildSubAutomaton(patterns);
+        subVersion++; // 强制 processElement 重新扫描（签名里带了 subVersion）
+    }
+    return changed;
+}
+
+// 构建订阅自动机：核心函数缺失或异常时降级为「不标记」，
+// 绝不让一个可选的订阅功能把整个脚本（尤其是 async 链路）带崩。
+function buildSubAutomaton(patterns) {
+    if (!patterns.length) return null;
+    if (typeof buildAutomaton !== 'function') {
+        subEngineError = '核心匹配函数缺失（脚本可能未完整安装）';
+        return null;
+    }
+    try {
+        return buildAutomaton(patterns);
+    } catch (e) {
+        subEngineError = (e && e.message) || '构建订阅自动机失败';
+        return null;
+    }
+}
+
+// 订阅匹配：任何异常都吞掉，返回空命中
+function subMatchesOf(normText) {
+    if (!SUB_AC || typeof pickMatches !== 'function') return [];
+    try {
+        return pickMatches(SUB_AC, normText, OPTIONS) || [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function subCacheRead() {
+    let raw = null;
+    try {
+        if (typeof GM_getValue === 'function') raw = GM_getValue(SUB_KEY, null);
+        else raw = localStorage.getItem(SUB_KEY);
+    } catch (e) {
+        raw = null;
+    }
+    if (!raw) return null;
+    try {
+        const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (!obj || !Array.isArray(obj.names)) return null;
+        return obj;
+    } catch (e) {
+        return null;
+    }
+}
+
+function subCacheWrite(obj) {
+    const raw = JSON.stringify(obj);
+    try {
+        if (typeof GM_setValue === 'function') GM_setValue(SUB_KEY, raw);
+        else localStorage.setItem(SUB_KEY, raw);
+    } catch (e) {
+        /* ignore */
+    }
+}
+
+/* ---------------- 唯一途径：直接读订阅页的女优卡片 ---------------- */
+
+// 当前是否在「女优展示 → 收藏」标签页。
+// 注意：/showcase 有三个 tab（首页 all / 我的 my / 收藏 fav），首页也会显示一整页女优，
+// 所以**不能只看 URL 有没有 action=fav**（SPA 切 tab 时 URL 可能没及时更新），
+// 优先看 antd Tabs 当前激活的那一项的 data-node-key。
+function isShowcaseFavPage() {
+    let href = '';
+    try {
+        href = String(window.location.href || '');
+    } catch (e) {
+        return false;
+    }
+
+    // 路径必须是 /showcase 本身（排除 /showcaseDetail?id=...）
+    let pathname = '';
+    try {
+        pathname = new URL(href).pathname;
+    } catch (e) {
+        pathname = href.split(/[?#]/)[0];
+    }
+    if (!/\/showcase\/?$/i.test(pathname)) return false;
+
+    // 1) 有 Tabs：以「激活的 tab」为准（data-node-key 与语言无关）
+    let tab = null;
+    try {
+        tab = document.querySelector('.ant-tabs-tab-active');
+    } catch (e) {
+        tab = null;
+    }
+    if (tab) {
+        const attr = tab.getAttribute ? tab.getAttribute.bind(tab) : null;
+        const key = (attr && (attr('data-node-key') || attr('data-key') || attr('data-tab-key'))) || '';
+        if (key) return /^fav$/i.test(key) || /[-_]fav$/i.test(key);
+        // 老版本 antd 没有 data-node-key 时退回文案判断
+        return /收藏|已订阅|最愛|favorite|\bfav\b/i.test(tab.textContent || '');
+    }
+
+    // 2) 没有 Tabs（单页渲染）：退回 URL 参数
+    try {
+        const u = new URL(href);
+        return (u.searchParams.get('action') || '') === 'fav';
+    } catch (e) {
+        return /[?&]action=fav(?:&|$)/i.test(href);
+    }
+}
+
+// 当前激活的 TabPane 容器（没有就退回 document），保证只读「收藏」这一屏的卡片
+function subActivePane() {
+    try {
+        const pane = document.querySelector('.ant-tabs-tabpane-active');
+        if (pane && pane.querySelectorAll) return pane;
+    } catch (e) {
+        /* ignore */
+    }
+    return document;
+}
+
+// 卡片结构（见前端 showcase.*.chunk.js）：
+//   <a href="/showcaseDetail?id=xx"><img alt="三上悠亜"></a>       ← 无文本，取 img alt 兜底
+//   <a href="/showcaseDetail?id=xx">三上悠亜</a>                  ← 名字链接，取 textContent
+// 站点改版换过路径，所以多套选择器都试；全不命中时再用卡片图片 alt 兜底。
+// 从某个根节点里抓女优名：先按卡片链接取文本/图片 alt，链接一套都不命中时再用图片 alt 兜底
+function collectDomNames(root) {
+    const names = [];
+    const seen = new Set();
+    const push = (v) => {
+        const t = String(v || '').replace(/\s+/g, ' ').trim();
+        if (!t || t.length > 40) return; // 过滤超长说明 / 空文本
+        if (SUB_UI_WORDS.test(t)) return;
+        if (/^(https?:|\/)/i.test(t)) return;
+        if (/logo|avatar|icon|banner|placeholder/i.test(t)) return;
+        if (seen.has(t)) return;
+        seen.add(t);
+        names.push(t);
+    };
+    const each = (sel, fn) => {
+        let nodes;
+        try { nodes = root.querySelectorAll(sel); } catch (e) { nodes = null; }
+        if (!nodes) return;
+        const list = typeof nodes.forEach === 'function' ? nodes : Array.prototype.slice.call(nodes);
+        list.forEach(fn);
+    };
+
+    // 1) 卡片链接：文本优先，其次链接里的图片 alt
+    SUB_DOM_SELECTORS.forEach((sel) => {
+        each(sel, (a) => {
+            if (!a) return;
+            const text = String(a.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text) return push(text);
+            let img = null;
+            try { img = a.querySelector ? a.querySelector('img') : null; } catch (e) { img = null; }
+            if (img && img.getAttribute) push(img.getAttribute('alt'));
+        });
+    });
+
+    // 2) 兜底：卡片封面图的 alt 通常就是女优名（站点把卡片做成 div / 没有 href 时靠这个）
+    //    只在前面一套都没命中时启用，避免把页面上无关图片的 alt 混进来
+    if (!names.length) {
+        each('img', (img) => {
+            const alt = img && img.getAttribute ? img.getAttribute('alt') : '';
+            if (alt) push(alt);
+        });
+    }
+
+    return names;
+}
+
+function subDomNames() {
+    const pane = subActivePane();
+    // 激活 pane 优先：首页/我的里的卡片即使还在 DOM 里也不会被算进来
+    const fromPane = collectDomNames(pane);
+    if (fromPane.length) return fromPane;
+    // 站点会把收藏列表渲染在 antd pane 之外（实测 pane 里一张卡都没有）：
+    // 这时退回整页再抓一次，否则明明页面上有卡片却读不到
+    if (pane && pane !== document) {
+        const fromDoc = collectDomNames(document);
+        if (fromDoc.length) return fromDoc;
+    }
+    return fromPane;
+}
+
+// 把 DOM 抓到的名字写进缓存。
+// - replace=true（用户主动点按钮刷新）：以当前页为准，可直接清掉之前混进来的脏数据
+// - replace=false 且存在分页控件（订阅超过一页）：做并集，避免只读第一页就把后面的覆盖掉
+// - 其余情况：以 DOM 为准（这样取消订阅也能反映出来）
+function applyDomSubNames(names, replace) {
+    const uniq = [];
+    const seen = new Set();
+    for (const n of names) {
+        if (n && !seen.has(n)) {
+            seen.add(n);
+            uniq.push(n);
+        }
+    }
+    if (!uniq.length) return false;
+
+    let multiPage = false;
+    try {
+        multiPage = !!document.querySelector('.ant-pagination');
+    } catch (e) {
+        multiPage = false;
+    }
+
+    let finalNames = uniq;
+    if (!replace && multiPage) {
+        const prev = subCacheRead();
+        if (prev && Array.isArray(prev.names)) {
+            const merged = [];
+            const mseen = new Set();
+            for (const n of prev.names.concat(uniq)) {
+                if (n && !mseen.has(n)) {
+                    mseen.add(n);
+                    merged.push(n);
+                }
+            }
+            finalNames = merged;
+        }
+    }
+
+    const changed = applySubNames(finalNames);
+    const prevCount = subCount;
+    subCount = finalNames.length;
+    // 名单没变化就不重复写存储（scanAll 会频繁调用）
+    if (changed || prevCount !== subCount) {
+        subCacheWrite({ ts: Date.now(), names: finalNames, total: subCount, source: 'dom' });
+    }
+    return changed || prevCount !== subCount;
+}
+
+// 载入订阅名单。脚本绝不发网络请求，也绝不自动监测页面：
+// - force=false（仅 boot 时调用一次）：只读本地缓存，让名单秒开；不读 DOM、不轮询。
+// - force=true（用户点面板「已订阅」按钮）：
+//     · 在订阅页：从页面卡片 DOM 读一次，读到就覆盖旧缓存；
+//     · 不在订阅页：只读缓存；若名单为 0，弹提示引导去订阅页点一次。
+function refreshSubscriptions(force) {
+    let changed = false;
+
+    if (force && isShowcaseFavPage()) {
+        // 订阅页：DOM 是唯一真相源，一个网络请求都不发
+        let domNames = [];
+        try { domNames = subDomNames(); } catch (e) { domNames = []; }
+        if (domNames.length) {
+            changed = applyDomSubNames(domNames, true);
+            subDomWarned = false;
+        } else {
+            // 卡片还没渲染出来：打一次结构诊断，提示稍后再点，绝不退回接口
+            if (!subDomWarned) {
+                subDomWarned = true;
+                warnNoSubCards();
+            }
+            showSubToast('还没读到订阅名单，等卡片加载出来后再点一次「' + SUB_BADGE_TEXT + '」。', false);
+        }
+    } else {
+        // 非订阅页 / boot：只读本地缓存，不发请求、不读 DOM
+        try {
+            const cached = subCacheRead();
+            if (cached && Array.isArray(cached.names)) {
+                applySubNames(cached.names);
+                subCount = cached.total > 0 ? cached.total : cached.names.length;
+                changed = true;
+            }
+        } catch (e) {
+            /* 订阅是可选增强，异常只影响它自己 */
+        }
+        if (force && subCount === 0) {
+            showSubToast('还没有订阅名单，请到「女优订阅页」点一次「' + SUB_BADGE_TEXT + '」按钮同步。', true);
+        }
+    }
+
+    renderSubUI();
+    if (changed || subCount) scanAll();
+}
+
+// 收藏页读不到卡片时，打印一份页面结构，方便定位选择器是否要更新
+function warnNoSubCards() {
+    try {
+        const tab = document.querySelector('.ant-tabs-tab-active');
+        const hrefs = Array.prototype.slice
+            .call(document.querySelectorAll('a[href]')).slice(0, 12)
+            .map((a) => a.getAttribute('href'));
+        const alts = Array.prototype.slice
+            .call(document.querySelectorAll('img[alt]')).slice(0, 12)
+            .map((i) => i.getAttribute('alt'));
+        // eslint-disable-next-line no-console
+        console.warn(
+            '[M-Team 订阅] 收藏页暂时读不到卡片。下面这份页面结构可直接定位选择器：\n' +
+            JSON.stringify({
+                href: String(window.location.href || ''),
+                tab: tab ? {
+                    key: tab.getAttribute('data-node-key') || tab.getAttribute('data-key') || '',
+                    text: String(tab.textContent || '').trim().slice(0, 20),
+                } : null,
+                pane: (function () {
+                    try {
+                        const p = subActivePane();
+                        return {
+                            isDocument: p === document,
+                            imgs: p.querySelectorAll('img').length,
+                            links: p.querySelectorAll('a[href]').length,
+                        };
+                    } catch (e) { return null; }
+                })(),
+                hrefs,
+                alts,
+            }, null, 1),
+        );
+    } catch (e) { /* ignore */ }
+}
+
+/* ============================================================
  * 身高标签渲染
  * ============================================================ */
 function makeBadge(name, height) {
@@ -94,6 +515,16 @@ function makeBadge(name, height) {
     span.textContent = OPTIONS.suffixTemplate.replace('{h}', String(height));
     span.title = `${name} · ${height}cm`;
     span.setAttribute('data-mt-height', String(height));
+    return span;
+}
+
+// 「订」标签：方形绿标，表示该女优在 M-Team 女优展示里被我订阅
+function makeSubBadge() {
+    const span = document.createElement('span');
+    span.className = 'mt-sub-badge';
+    span.textContent = SUB_BADGE_TEXT;
+    span.title = '已订阅该女优';
+    span.setAttribute('data-mt-sub', '1');
     return span;
 }
 
@@ -122,6 +553,29 @@ function injectStyle() {
             background: rgba(77, 208, 200, 0.14);
             border-color: rgba(77, 208, 200, 0.38);
         }
+        /* 「已订阅」= M-Team 女优展示收藏标签：绿色圆角标 */
+        .mt-sub-badge {
+            display: inline-block;
+            box-sizing: border-box;
+            margin: 0 2px;
+            padding: 0 5px;
+            border-radius: 2px;
+            font-size: 0.7em;
+            font-weight: 700;
+            line-height: 1.45;
+            text-align: center;
+            vertical-align: 1px;
+            color: #fff;
+            background: #18a058;
+            border: 1px solid #0f7a40;
+            white-space: nowrap;
+            cursor: help;
+        }
+        html.mt-dark .mt-sub-badge {
+            color: #d9ffe9;
+            background: rgba(24, 160, 88, 0.55);
+            border-color: rgba(80, 220, 150, 0.7);
+        }
     `;
     (document.head || document.documentElement).appendChild(style);
 }
@@ -134,7 +588,7 @@ function textNodesOf(el) {
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
         acceptNode(n) {
             if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-            if (n.parentElement && n.parentElement.closest('.mt-height-badge')) {
+            if (n.parentElement && n.parentElement.closest('.mt-height-badge, .mt-sub-badge')) {
                 return NodeFilter.FILTER_REJECT;
             }
             return NodeFilter.FILTER_ACCEPT;
@@ -149,33 +603,48 @@ function processElement(el) {
     const nodes = textNodesOf(el);
     if (!nodes.length) return;
 
+    // 第一步：只拼文本 + 算签名，不分配任何对象。
+    // 早期版本在这里就为每个字符建 {node, off}，列表页每条标题几十字符 × 上千条，
+    // 即便文本没变（签名相同会早退）也已分配完，制造海量垃圾 → GC 抖动 → 页面假死。
     let text = '';
-    const anchors = []; // 每个字符 -> {node, off}
-    for (const n of nodes) {
-        const v = n.nodeValue;
-        for (let i = 0; i < v.length; i++) anchors.push({ node: n, off: i });
-        text += v;
-    }
+    for (const n of nodes) text += n.nodeValue;
     if (!text) return;
 
-    // 文本未变化则跳过（避免 MutationObserver 自触发死循环）
-    if (el.getAttribute('data-mt-height-sig') === hash(text)) return;
+    const sig = hash(text) + ':' + subVersion + ':' + (isEnabled() ? '1' : '0');
+    if (el.getAttribute('data-mt-height-sig') === sig) return;
 
-    // 文本已变化（SPA 复用节点等场景）：先清理旧标签，再重新插入
-    el.querySelectorAll('.mt-height-badge').forEach((b) => b.remove());
+    // 文本确实变了才往下走：先清旧标签，再匹配
+    el.querySelectorAll('.mt-height-badge, .mt-sub-badge').forEach((b) => b.remove());
 
-    // 归一化后扫描：全角英数/空格/括号 → 半角，长度不变，anchors 偏移仍有效
     const normText = normalizeStr(text);
-    const matches = pickMatches(AC, normText, OPTIONS);
-    if (!matches.length) {
-        el.setAttribute('data-mt-height-sig', hash(text));
+    const matches = (isEnabled() && !FEATURE_OFF.badge) ? pickMatches(AC, normText, OPTIONS) : [];
+    const subHits = subMatchesOf(normText);
+    if (!matches.length && !subHits.length) {
+        el.setAttribute('data-mt-height-sig', sig);
         return;
     }
+
+    // 惰性构建字符→节点映射：只有真正要插标签时才建，
+    // 且只在命中附近建（用每个节点的字符区间推导），不再为每个字符单独建对象。
+    const spans = []; // {node, start, end}
+    let cursor = 0;
+    for (const n of nodes) {
+        const len = n.nodeValue.length;
+        spans.push({ node: n, start: cursor, end: cursor + len });
+        cursor += len;
+    }
+    const anchorAt = (idx) => {
+        for (let i = 0; i < spans.length; i++) {
+            const s = spans[i];
+            if (idx >= s.start && idx < s.end) return { node: s.node, off: idx - s.start };
+        }
+        return null;
+    };
 
     // 从后往前插入，保证前面锚点偏移仍有效
     matches.sort((a, b) => b.end - a.end);
     for (const m of matches) {
-        const anchor = anchors[m.end - 1];
+        const anchor = anchorAt(m.end - 1);
         if (!anchor || !anchor.node.isConnected) continue;
         const name = AC.patterns[m.p];
         const height = NORMALIZED_HEIGHT[name];
@@ -190,7 +659,10 @@ function processElement(el) {
             /* 忽略异常节点 */
         }
     }
-    el.setAttribute('data-mt-height-sig', hash(text));
+
+    if (subHits.length) el.appendChild(makeSubBadge());
+
+    el.setAttribute('data-mt-height-sig', sig);
 }
 
 // 轻量字符串哈希（仅用于变更检测）
@@ -224,32 +696,123 @@ function writeThumbSize(v) {
     }
 }
 
+// 已注册过 load 回调的图片：懒加载图在 complete 之前 mtFitSize 一直是空的，
+// 若每次 scanAll 都注册一个 load 监听器，滚动时图片陆续加载 → 回调成百上千地累积，
+// 图片一加载完就批量触发 setProperty + 读 naturalWidth（强制布局）→ 页面假死。
+const _thumbLoadHooked = (typeof WeakSet === 'function') ? new WeakSet() : null;
+
+/* 缩略图缩放队列：两个卡顿源分别对付。
+ * ① 每张图的回调里「读一张 naturalWidth → 写一张 style」交替进行，浏览器被迫反复同步布局
+ *    （layout thrashing）。改成「先集中读、再集中写」，重排从 N 次降到 1 次。
+ * ② 表格里改图片宽高会让整张表重新布局（列宽依赖内容宽度）。滚动时一次涌入几十上百张图，
+ *    若边滚边改尺寸，就是几十上百次全表重排 → 电脑直接卡死。
+ *    所以滚动期间只入队不落地，滚动停下（160ms 无 scroll）后再一次性处理。
+ */
+const _fitQueue = [];
+// 排队去重：靠数组 indexOf 在大批量入队时是 O(n²)，换成 WeakSet 做 O(1)
+const _fitQueued = (typeof WeakSet === 'function') ? new WeakSet() : null;
+let _fitScheduled = false;
+let _fitTimer = null;
+
+const FIT_IDLE_MS = 160;
+let _lastScrollAt = 0;
+try {
+    if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+        // scroll 不冒泡，但捕获阶段能从任意滚动容器传到 window，所以用 capture
+        window.addEventListener('scroll', () => { _lastScrollAt = Date.now(); }, { passive: true, capture: true });
+    }
+} catch (e) { /* ignore */ }
+
+function flushFitQueue() {
+    if (!_fitQueue.length) return;
+    const batch = _fitQueue.splice(0);
+    const s = thumbSize; // 取实时值，切换尺寸后不回退
+    const n = batch.length;
+    // 第一段：集中读，中间不穿插任何写
+    const ws = new Array(n);
+    const hs = new Array(n);
+    for (let i = 0; i < n; i++) {
+        ws[i] = batch[i].naturalWidth;
+        hs[i] = batch[i].naturalHeight;
+    }
+    // 第二段：集中写
+    for (let i = 0; i < n; i++) {
+        const img = batch[i];
+        if (_fitQueued) _fitQueued.delete(img); // 以后还能重新入队（换尺寸 / 被移除后重新插入）
+        const w = ws[i];
+        const h = hs[i];
+        if (!w || !h || !img.isConnected) continue;
+        // 异步解码：DMM 封面动辄 800×1200，同步解码会卡在渲染那一步。
+        // 我们又把图放大了，重解码的分辨率更高，100 张图串起来就是主线程级别的卡顿。
+        try { img.decoding = 'async'; } catch (e) { /* ignore */ }
+        // 宽高都算成具体像素，不用 width:auto —— 否则布局要依赖图片的固有比例，
+        // 图片还没解码完时浏览器可能先按 0 排一次、解码后再排一次，等于两次全表重排。
+        if (w >= h) {
+            img.style.setProperty('height', s + 'px', 'important');
+            img.style.setProperty('width', Math.round((s * w) / h) + 'px', 'important');
+        } else {
+            img.style.setProperty('width', s + 'px', 'important');
+            img.style.setProperty('height', Math.round((s * h) / w) + 'px', 'important');
+        }
+        img.dataset.mtFitSize = String(s);
+        img.dataset.mtFitSrc = img.currentSrc || img.src || '';
+    }
+}
+
+function runFitFlush() {
+    if (!_fitQueue.length) {
+        _fitScheduled = false;
+        return;
+    }
+    // 首屏还没加载完（或还在滚动）：先不落地。
+    // 首屏阶段每张图加载完就改一次尺寸，等于每张图触发一次整表重排，100 张图就是 100 次；
+    // 攒到 load 之后一次性处理，重排次数从 100 降到 1。
+    if (pageStillLoading() || Date.now() - _lastScrollAt < FIT_IDLE_MS) {
+        if (_fitTimer === null) {
+            _fitTimer = setTimeout(() => {
+                _fitTimer = null;
+                runFitFlush();
+            }, 300);
+        }
+        return;
+    }
+    _fitScheduled = false;
+    flushFitQueue();
+}
+
+function scheduleFitFlush() {
+    if (_fitScheduled) return;
+    _fitScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(runFitFlush);
+    else setTimeout(runFitFlush, 0);
+}
+
+function enqueueFit(img) {
+    if (!img) return;
+    if (_fitQueued) {
+        if (_fitQueued.has(img)) return;
+        _fitQueued.add(img);
+    } else if (_fitQueue.indexOf(img) >= 0) {
+        return;
+    }
+    _fitQueue.push(img);
+    scheduleFitFlush();
+}
+
 // 列表图按短边 thumbSize 等比缩放：横图压高度、竖图压宽度
 function applyListThumbSize() {
+    if (FEATURE_OFF.thumb) return; // 排障开关
     const size = thumbSize;
     document.querySelectorAll('.torrent-list__thumbnail').forEach((img) => {
         const src = img.currentSrc || img.src || '';
         if (img.dataset.mtFitSize === String(size) && img.dataset.mtFitSrc === src) return;
 
-        const fit = () => {
-            const s = thumbSize; // 取实时值，避免切换尺寸后个别图被旧回调改回去
-            const w = img.naturalWidth, h = img.naturalHeight;
-            if (!w || !h) return;
-            if (w >= h) {
-                img.style.setProperty('height', s + 'px', 'important');
-                img.style.setProperty('width', 'auto', 'important');
-            } else {
-                img.style.setProperty('width', s + 'px', 'important');
-                img.style.setProperty('height', 'auto', 'important');
-            }
-            img.dataset.mtFitSize = String(s);
-            img.dataset.mtFitSrc = img.currentSrc || img.src || '';
-        };
-
         if (img.complete && img.naturalWidth) {
-            fit();
-        } else {
-            img.addEventListener('load', fit, { once: true });
+            enqueueFit(img);
+        } else if (!_thumbLoadHooked || !_thumbLoadHooked.has(img)) {
+            // 每张图只注册一次 load；加载完也走队列批量处理
+            if (_thumbLoadHooked) _thumbLoadHooked.add(img);
+            img.addEventListener('load', () => enqueueFit(img), { once: true });
         }
     });
 }
@@ -270,9 +833,14 @@ function inTorrentListRow(link) {
 }
 
 function injectFullTitleStyle() {
+    if (FEATURE_OFF.title) return; // 排障开关
     if (document.getElementById(FULL_TITLE_STYLE_ID)) return;
     const style = document.createElement('style');
     style.id = FULL_TITLE_STYLE_ID;
+    // 注意：这里一律用 overflow-wrap: break-word，不要用 anywhere。
+    // anywhere 会把「最小内容宽度」算成一个字符宽，表格（table-layout:auto）每次算列宽
+    // 都要对每个单元格重算内在尺寸 —— 几千行的表能算出 1 秒以上的主线程阻塞。
+    // break-word 只在实在放不下时才断词，不参与内在尺寸计算，效果一样但便宜得多。
     style.textContent = `
         /* 新版界面已知结构：直接放开标题，避免首屏渲染时的闪烁 */
         .app-content__inner table.w-full tbody a[href*="/detail/"],
@@ -283,8 +851,7 @@ function injectFullTitleStyle() {
             -webkit-line-clamp: unset !important;
             line-clamp: unset !important;
             max-height: none !important;
-            word-break: break-word !important;
-            overflow-wrap: anywhere !important;
+            overflow-wrap: break-word !important;
         }
         /* 运行时检测到被截断的元素（含外层包裹容器），统一放开 */
         .${FULL_TITLE_CLASS},
@@ -297,8 +864,11 @@ function injectFullTitleStyle() {
             max-height: none !important;
             -webkit-mask-image: none !important;
             mask-image: none !important;
-            word-break: break-word !important;
-            overflow-wrap: anywhere !important;
+            overflow-wrap: break-word !important;
+        }
+        /* 上面的 * 会连身高标签一起放开换行，这里单独压回去 */
+        .${FULL_TITLE_CLASS} .mt-height-badge {
+            white-space: nowrap !important;
         }
     `;
     (document.head || document.documentElement).appendChild(style);
@@ -322,31 +892,61 @@ function isClippedElement(el) {
     );
 }
 
+// 已检测过截断的节点：getComputedStyle 会强制同步样式重算，列表页每条标题+子元素+4层父元素
+// 都调用它是主要卡顿来源。检测结果缓存起来；SPA 替换节点后是新对象，会自然重新检测。
+const _fullChecked = (typeof WeakSet === 'function') ? new WeakSet() : null;
+
+// 表格骨架标签：绝不能给它们打 .mt-full-title。
+// 继承给 tr/td 后，`.mt-full-title *` 会把这一行（甚至整个 tbody）里所有元素都套上
+// white-space/overflow 的 !important 规则 —— 样式重算面积从「一个标题」变成「一整页」，
+// 滚动时每次新行进来都要重算，主线程就是这么被堵死 1 秒的。
+const STRUCT_TAGS = {
+    TABLE: 1, THEAD: 1, TBODY: 1, TFOOT: 1, TR: 1, TD: 1, TH: 1, COLGROUP: 1, COL: 1,
+};
+
 // 找到列表行里被截断的标题元素及其外层容器，打上标记类放开显示
+//
+// 必须分三段做（登记 → 集中读 → 集中写），不能边检测边加类：
+// getComputedStyle 会同步重算样式，而加类又会让样式失效；两者交错时每加一个类就要把整页
+// 样式重算一遍。滚动加载几百行时这里有上万个候选节点，就是上万次全量重算 → 页面假死。
 function applyFullTitles() {
+    if (FEATURE_OFF.title) return; // 排障开关
     injectFullTitleStyle();
 
-    const mark = (el) => {
+    // ① 只遍历登记本轮新出现、尚未检测过的节点：不读样式、不写 DOM
+    const fresh = [];
+    const collect = (el) => {
         if (!el || !el.classList) return;
-        // 身高标签本身不参与截断放开
-        if (el.closest && el.closest('.mt-height-badge')) return;
-        if (!el.classList.contains(FULL_TITLE_CLASS) && isClippedElement(el)) {
-            el.classList.add(FULL_TITLE_CLASS);
+        if (STRUCT_TAGS[el.tagName]) return; // 表格骨架不参与（见上面注释）
+        if (el.closest && el.closest('.mt-height-badge')) return; // 身高标签不参与
+        if (_fullChecked) {
+            if (_fullChecked.has(el)) return;
+            _fullChecked.add(el);
         }
+        if (!el.classList.contains(FULL_TITLE_CLASS)) fresh.push(el);
     };
 
     document.querySelectorAll(TITLE_LINK_SELECTOR).forEach((link) => {
         if (!inTorrentListRow(link)) return;
 
-        mark(link);
-        link.querySelectorAll('*').forEach(mark);
+        collect(link);
+        link.querySelectorAll('*').forEach(collect);
 
         // 标题链接向上 1~4 层：覆盖「外层 div 负责裁切」的情况
         let p = link.parentElement;
-        for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
-            mark(p);
-        }
+        for (let i = 0; i < 4 && p; i++, p = p.parentElement) collect(p);
     });
+    if (!fresh.length) return;
+
+    // ② 集中读：全程只调 getComputedStyle，中间不做任何样式写入
+    const clipped = [];
+    for (let i = 0; i < fresh.length; i++) {
+        if (isClippedElement(fresh[i])) clipped.push(fresh[i]);
+    }
+    if (!clipped.length) return;
+
+    // ③ 集中写：一次性加类，浏览器只需重算一次样式
+    for (let i = 0; i < clipped.length; i++) clipped[i].classList.add(FULL_TITLE_CLASS);
 }
 
 /* ============================================================
@@ -389,9 +989,11 @@ function fixOldSiteThumbs() {
 /* ============================================================
  * 扫描调度
  * ============================================================ */
+// 选择器串只拼一次：每次 scanAll 都 concat+join 会白白产生一堆临时字符串
+const TARGET_SELECTOR_LIST = TARGET_SELECTORS.concat(OPTIONS.extraSelectors).join(',');
+
 function selectorAll() {
-    const list = TARGET_SELECTORS.concat(OPTIONS.extraSelectors).join(',');
-    return document.querySelectorAll(list);
+    return document.querySelectorAll(TARGET_SELECTOR_LIST);
 }
 
 /**
@@ -399,14 +1001,38 @@ function selectorAll() {
  * - 新版详情页标题（h2 内含 span.align-middle）
  * - 详情页副标题（Ant Design / NexusPHP 表格中标签为「副標題」「副标题」等的单元格）
  */
+
+// 详情页路径判定（列表页无需找副标题的 XPath）
+function isDetailPage() {
+    try {
+        const href = String(window.location.href || '');
+        return /\/detail\/|details\.php/i.test(href);
+    } catch (e) {
+        return false;
+    }
+}
+
+// XPath 是否可用：探测一次并缓存结果，避免每次扫描都抛异常再 catch
+let _xpathOk = null;
+function xpathAvailable() {
+    if (_xpathOk !== null) return _xpathOk;
+    _xpathOk = !!(typeof document.evaluate === 'function' && typeof XPathResult !== 'undefined');
+    return _xpathOk;
+}
+
 function findDynamicTargets() {
     const results = [];
+
+    // 下面两类目标都只存在于详情页：列表页直接返回，省掉一次全文档 h2 查询 + 5 次 XPath
+    if (!isDetailPage()) return results;
 
     // 新版详情页标题 h2（含 span.align-middle）
     document.querySelectorAll('h2 span.align-middle').forEach((span) => {
         const h2 = span.parentElement;
         if (h2 && h2.tagName === 'H2' && !results.includes(h2)) results.push(h2);
     });
+
+    if (!xpathAvailable()) return results;
 
     // 详情页副标题：XPath 查找标签单元格旁的内容单元格
     // 覆盖新版 Ant Design（td/th 标签）与旧版 NexusPHP（td 标签）
@@ -424,7 +1050,7 @@ function findDynamicTargets() {
             }
         }
     } catch (e) {
-        /* XPath 不可用时忽略 */
+        _xpathOk = false;
     }
 
     return results;
@@ -436,20 +1062,50 @@ function scanAll() {
     applyFullTitles();
     if (!IS_NEXT_SITE) fixOldSiteThumbs();
     syncFavStar(); // SPA 切页后同步星星的亮/灭
+    // 订阅不再自动监测：只在用户点面板按钮时读一次（refreshSubscriptions）。
+    // 这里只同步按钮文字，不抓 DOM、不发请求。
+    syncSubUI();
 
-    // 身高标注：受开关控制
-    if (!isEnabled()) return;
-    selectorAll().forEach(processElement);
-    findDynamicTargets().forEach(processElement);
+    // 身高标签受开关控制（在 processElement 内判断）；「已订阅」标签只看订阅集合
+    // querySelectorAll 返回 NodeList（无 concat），先转真数组再合并
+    const targets = Array.prototype.slice.call(selectorAll()).concat(findDynamicTargets());
+    targets.forEach(processElement);
 }
 
 let timer = null;
+let _lastScanMs = 0;
+
+// 页面还在首屏加载阶段？这时站点自己也在狂渲染（React 首次渲染 + 图片解码），
+// 我们再插标签、改图片尺寸，就会和它互相放大：我们改一次 → 它重排一次 → 又一次。
+// 超过 8 秒还没 load 完就不再干等（有些站点有长轮询，永远到不了 complete）。
+let _bootAt = 0;
+function pageStillLoading() {
+    try {
+        const rs = document.readyState;
+        if (rs !== 'loading' && rs !== 'interactive') return false;
+        return !(_bootAt && Date.now() - _bootAt > 8000);
+    } catch (e) {
+        return false;
+    }
+}
+
+function runScheduledScan() {
+    timer = null;
+    if (pageStillLoading()) {
+        // 首屏还没结束：先攒着，load 之后再扫。boot 里已经同步扫过一次，标签不会缺席。
+        timer = setTimeout(runScheduledScan, 500);
+        return;
+    }
+    const t0 = Date.now();
+    scanAll();
+    _lastScanMs = Date.now() - t0;
+}
+
 function scheduleScan() {
     if (timer) return;
-    timer = setTimeout(() => {
-        timer = null;
-        scanAll();
-    }, 250);
+    // 单次扫描变慢时自动降频：宁可标签晚一点出现，也不能每秒烧掉好几秒 CPU。
+    const delay = _lastScanMs > 150 ? 1000 : 250;
+    timer = setTimeout(runScheduledScan, delay);
 }
 
 function startObserver() {
@@ -457,12 +1113,15 @@ function startObserver() {
         for (const r of records) {
             // 忽略由本脚本插入的节点引起的变更
             if (r.target && r.target.nodeType === 1 &&
-                r.target.closest && r.target.closest('.mt-height-badge')) continue;
+                r.target.closest && r.target.closest('.mt-height-badge, .mt-sub-badge')) continue;
             scheduleScan();
             return;
         }
     });
-    mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+    // 只监听节点增删：列表页的做种数/下载量等文本频繁变动，若监听 characterData
+    // 会把每次数字刷新都变成一次全量 scanAll，是卡顿主因。SPA 换文本通常伴随子节点
+    // 增删（childList），少量纯文本场景由 boot 的 800/2000/5000ms 兜底扫描覆盖。
+    mo.observe(document.body, { childList: true, subtree: true });
 }
 
 /* ============================================================
@@ -589,6 +1248,36 @@ function injectPanelStyle() {
             border-color: #f5c518 !important;
             color: #f5c518 !important;
         }
+        #mt-height-panel .mt-sub-btn {
+            appearance: none;
+            border: 1px solid rgba(24, 160, 88, 0.6) !important;
+            background: transparent !important;
+            color: #7ee2a8 !important;
+            padding: 2px 8px;
+            border-radius: 999px;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        #mt-height-panel .mt-sub-btn:hover,
+        #mt-height-panel .mt-sub-btn.mt-sub-on {
+            background: rgba(24, 160, 88, 0.22) !important;
+            border-color: #18a058 !important;
+            color: #fff !important;
+        }
+        #mt-height-panel .mt-sub-btn.mt-loading {
+            opacity: 0.55;
+            cursor: progress;
+        }
+        /* 接口读不到时在按钮上留一个可见的「!」，具体原因放在 title / 控制台 */
+        #mt-height-panel .mt-sub-btn.mt-sub-error {
+            border-color: #d4380d !important;
+            color: #ffb3a1 !important;
+        }
+        #mt-height-panel .mt-sub-btn.mt-sub-error::after {
+            content: ' !';
+            color: #ff7875;
+        }
         #mt-fav-panel {
             position: fixed;
             right: 14px;
@@ -701,6 +1390,15 @@ function buildPanel() {
     favBtn.addEventListener('click', toggleFavList);
     wrap.appendChild(favBtn);
 
+    // 订阅：显示已订阅女优数量；点击才读一次（订阅页读 DOM，其它页只读缓存）
+    const subBtn = document.createElement('button');
+    subBtn.type = 'button';
+    subBtn.className = 'mt-sub-btn';
+    subBtn.textContent = `${SUB_BADGE_TEXT} 0`;
+    subBtn.title = '在订阅页点此读取名单；其它页面点此可查看当前缓存';
+    subBtn.addEventListener('click', () => refreshSubscriptions(true));
+    wrap.appendChild(subBtn);
+
     const sep2 = document.createElement('span');
     sep2.className = 'mt-panel-sep';
     wrap.appendChild(sep2);
@@ -767,12 +1465,93 @@ function favWrite(list) {
     } catch (e) {
         /* ignore */
     }
+    lastRaw = raw; // 同步更新本页快照，避免读回来又被当成「别的页面改了」
 }
 
 let favs = favRead();
 
+/* ============================================================
+ * 收藏数据同步（多标签页）
+ * ------------------------------------------------------------
+ * 问题：favs 原先只在脚本启动时读一次，之后每个标签页各持一份内存副本。
+ * 两个页面同时开着时，B 页基于旧副本写入，就会把 A 页刚加的收藏覆盖掉。
+ *
+ * 对策（以「存储为唯一真相源」）：
+ *  1) 每次操作/渲染前都重新读一次存储，把结果作为权威列表；
+ *  2) 写入前先把「存储里的最新数据 + 本页的这次操作」合到一起再落盘，
+ *     这样对端新增不会丢；
+ *  3) 本页的删除记进墓碑（tombstone），合并时不会被对端旧数据复活；
+ *  4) GM 环境用 GM_addValueChange、网页环境用 storage 事件做即时同步，
+ *     切回页面（visibilitychange / focus）时再补一次兜底。
+ * ============================================================ */
+let lastRaw = null;   // 本页最后一次读到的原始字符串
+let tombstones = new Map(); // 本页显式删除过的 url -> 时间戳，防止被远端合并复活
+
+function favRaw() {
+    let raw = null;
+    try {
+        if (typeof GM_getValue === 'function') raw = GM_getValue(FAV_KEY, null);
+        else raw = localStorage.getItem(FAV_KEY);
+    } catch (e) {
+        raw = null;
+    }
+    if (raw == null) return null;
+    return typeof raw === 'string' ? raw : JSON.stringify(raw);
+}
+
+// 收藏是 m-team 站内链接，统一主机名后再比较，避免 next.m-team.cc / kp.m-team.cc 互认不出
+function favKeyOf(url) {
+    try {
+        const u = new URL(url);
+        u.hostname = _host || u.hostname;
+        return u.href;
+    } catch (e) {
+        return url;
+    }
+}
+
+// 用存储里的数据重建本页内存列表（存储是唯一真相源）
+// 被本页显式删除的条目（墓碑）不复活；返回是否有变化
+function favMerge(raw) {
+    if (raw == null || raw === lastRaw) return false;
+    lastRaw = raw;
+    let remote;
+    try {
+        remote = JSON.parse(raw);
+    } catch (e) {
+        return false;
+    }
+    if (!Array.isArray(remote)) return false;
+
+    const prev = favs.slice();
+    const next = [];
+    const seen = new Set();
+    remote.forEach((f) => {
+        if (!f || !f.url) return;
+        const k = favKeyOf(f.url);
+        if (seen.has(k)) return;
+        if (tombstones.has(k)) return; // 本页删掉的，不被远端复活
+        // 保留本页条目对象（可能带本地字段），否则用远端的
+        const local = prev.find((x) => favKeyOf(x.url) === k);
+        next.push(local || { ...f, url: k });
+        seen.add(k);
+    });
+
+    const changed = next.length !== prev.length || next.some((f, i) => favKeyOf(f.url) !== favKeyOf(prev[i] && prev[i].url));
+    favs = next;
+    return changed;
+}
+
+// 从存储重新读一次并合并；返回是否有变化
+function favRefresh(force) {
+    const raw = favRaw();
+    if (!force && raw === lastRaw) return false;
+    return favMerge(raw);
+}
+
 function favIndex(url) {
-    return favs.findIndex((f) => f && f.url === url);
+    const key = favKeyOf(url);
+    return favs.findIndex((f) => f && favKeyOf(f.url) === key);
 }
 
 // 当前页面的地址与名称，拿不到就返回空，避免在异常环境里抛错
@@ -807,12 +1586,21 @@ function isCurrentFavored() {
 }
 
 // 收藏 / 取消收藏当前页
+// 关键：先 favRefresh 把「别的标签页刚写进去的数据」拉进来，再改动、再落盘，
+// 否则会基于旧副本写入，把对端的新增覆盖掉。
 function toggleFav() {
     const { url, name } = currentPage();
     if (!url) return;
-    const i = favIndex(url);
-    if (i >= 0) favs.splice(i, 1);
-    else favs.push({ url, name, ts: Date.now() });
+    favRefresh(); // 合并远端最新数据（A 页刚收藏的那条会在这里被拉进来）
+    const key = favKeyOf(url);
+    const i = favs.findIndex((f) => favKeyOf(f.url) === key);
+    if (i >= 0) {
+        tombstones.set(key, Date.now()); // 记墓碑：本页删掉的条目不复活
+        favs.splice(i, 1);
+    } else {
+        tombstones.delete(key);
+        favs.push({ url, name, ts: Date.now() });
+    }
     favWrite(favs);
     renderFavUI();
 }
@@ -850,8 +1638,10 @@ function renderFavList() {
         del.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            const i = favIndex(f.url);
-            if (i >= 0) favs.splice(i, 1);
+            favRefresh(); // 先对齐远端，避免误删刚同步到的条目
+            const key = favKeyOf(f.url);
+            tombstones.set(key, Date.now());
+            favs = favs.filter((x) => favKeyOf(x.url) !== key);
             favWrite(favs);
             renderFavUI();
         });
@@ -893,7 +1683,9 @@ function toggleFavList() {
 }
 
 // 同步星星状态、列表按钮上的数量，以及（若已展开）列表内容
+// 渲染前强制回读一次存储，保证永远显示别的标签页刚写入的结果
 function renderFavUI() {
+    favRefresh();
     const star = document.querySelector('#mt-height-panel .mt-fav-star');
     if (star) {
         const on = isCurrentFavored();
@@ -920,6 +1712,119 @@ function syncFavStar() {
 }
 
 /* ============================================================
+ * 订阅 UI：面板按钮上的已订阅数量与加载状态
+ * ============================================================ */
+// 手动点「已订阅」失败时给一个几秒后自动消失的提示：不常驻、不打扰浏览
+function showSubToast(msg, withLink) {
+    try {
+        const old = document.getElementById('mt-sub-toast');
+        if (old && old.remove) old.remove();
+        const box = document.createElement('div');
+        box.id = 'mt-sub-toast';
+        box.setAttribute('style', [
+            'position:fixed', 'left:50%', 'bottom:64px', 'transform:translateX(-50%)',
+            'z-index:100000', 'max-width:min(520px,90vw)', 'padding:8px 12px',
+            'border-radius:8px', 'background:rgba(24,24,28,.95)', 'color:#fff',
+            'font-size:12px', 'line-height:1.5', 'box-shadow:0 6px 24px rgba(0,0,0,.35)',
+        ].join(';'));
+        const text = document.createElement('span');
+        text.textContent = msg;
+        box.appendChild(text);
+        if (withLink) {
+            const a = document.createElement('a');
+            a.setAttribute('href', '/showcase?action=fav');
+            a.setAttribute('style', 'color:#7ee2a8;margin-left:8px;text-decoration:underline;cursor:pointer;');
+            a.textContent = '打开收藏页同步';
+            box.appendChild(a);
+        }
+        (document.body || document.documentElement).appendChild(box);
+        setTimeout(() => {
+            try { if (box.remove) box.remove(); } catch (e) { /* ignore */ }
+        }, 6000);
+    } catch (e) {
+        /* 提示失败不影响主流程 */
+    }
+}
+
+function subButton() {
+    try {
+        return document.querySelector('#mt-height-panel .mt-sub-btn');
+    } catch (e) {
+        return null;
+    }
+}
+
+function subButtonLabel() {
+    if (subEngineError) return `${SUB_BADGE_TEXT} !`;
+    return `${SUB_BADGE_TEXT} ${subCount}`;
+}
+
+function renderSubUI() {
+    const btn = subButton();
+    if (!btn) return;
+    btn.textContent = subButtonLabel();
+    btn.classList.toggle('mt-sub-on', subCount > 0);
+    btn.title = subEngineError
+        ? `订阅功能不可用：${subEngineError}`
+        : subCount > 0
+            ? `已订阅 ${subCount} 位女优 · 在订阅页点此可重新读取`
+            : `还没有订阅名单 · 请打开女优订阅页（/showcase?action=fav）点一次此按钮`;
+}
+
+// 扫描时只改真正变化的部分，避免自己触发 MutationObserver 死循环
+function syncSubUI() {
+    const btn = subButton();
+    if (!btn) return;
+    const want = subButtonLabel();
+    if (btn.textContent !== want) btn.textContent = want;
+    const on = subCount > 0;
+    if (btn.classList.contains('mt-sub-on') !== on) btn.classList.toggle('mt-sub-on', on);
+}
+
+/* ============================================================
+ * 跨标签页同步监听
+ * ============================================================ */
+function onFavExternalChange() {
+    // 别的页面改了收藏：更新内存、刷新星星与列表
+    favRefresh(true);
+    renderFavUI();
+}
+
+function watchFavStorage() {
+    // GM 环境：Tampermonkey 等支持 GM_addValueChange，跨标签页即时通知
+    try {
+        if (typeof GM_addValueChange === 'function') {
+            GM_addValueChange(FAV_KEY, (name, oldValue, newValue, remote) => {
+                if (!remote) return; // 忽略自己写的（自己已在 favWrite 里更新过内存）
+                onFavExternalChange();
+            });
+        }
+    } catch (e) {
+        /* ignore */
+    }
+
+    // 网页环境：localStorage 变化会以 storage 事件广播给同源的其他标签页
+    // （m-team 各子域不同源，跨子域靠 GM 通道；同子域的两个页面靠这里）
+    try {
+        window.addEventListener('storage', (e) => {
+            if (e && e.key === FAV_KEY) onFavExternalChange();
+        });
+    } catch (e) {
+        /* ignore */
+    }
+
+    // 兜底：切回本页 / 窗口获得焦点时补一次同步
+    try {
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) onFavExternalChange();
+        });
+        window.addEventListener('focus', onFavExternalChange);
+    } catch (e) {
+        /* ignore */
+    }
+}
+
+/* ============================================================
  * 站点判定 & 启动
  * ============================================================ */
 let _host = '';
@@ -934,11 +1839,36 @@ const IS_NEXT_SITE = _host === 'next.m-team.cc' || _host === 'kp.m-team.cc';
 function boot() {
     injectStyle();
     if (!IS_NEXT_SITE) injectOldSiteStyles();
+    _bootAt = Date.now();
     startObserver();
-    scanAll();
     buildPanel();
-    // 兜底：部分 SPA 场景 MutationObserver 可能漏掉，做几次延迟扫描
-    [800, 2000, 5000].forEach((t) => setTimeout(scanAll, t));
+    watchFavStorage(); // 监听其它标签页的收藏改动
+    // 订阅名单：只读本地缓存秒开，绝不自动联网、不监测页面接口。
+    // 需要更新时，请打开订阅页（/showcase?action=fav）点一次「已订阅」按钮。
+    refreshSubscriptions(false);
+
+    const firstScan = () => {
+        scanAll();
+        // 兜底：部分 SPA 场景 MutationObserver 可能漏掉，做几次延迟扫描
+        [800, 2000, 5000].forEach((t) => setTimeout(scanAll, t));
+    };
+
+    if (pageStillLoading() && typeof window !== 'undefined' && window &&
+        typeof window.addEventListener === 'function') {
+        // 首屏还在渲染（React 正在 hydration）：这时往标题里插 <span>、改图片尺寸，
+        // 会打断站点的首次渲染，React 发现 DOM 对不上就整棵树重新渲染一遍 —— 首屏直接多出秒级阻塞。
+        // 所以我们等 load 之后再动手（最多等 3 秒，避免长轮询站点永远等不到 load）。
+        let started = false;
+        const go = () => {
+            if (started) return;
+            started = true;
+            firstScan();
+        };
+        window.addEventListener('load', () => setTimeout(go, 0), { once: true });
+        setTimeout(go, 3000);
+    } else {
+        firstScan();
+    }
 }
 
 if (document.readyState === 'loading') {

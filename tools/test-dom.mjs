@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
  * test-dom.mjs — 在最小 DOM 环境里真实执行构建产物，验证「名字后面插入身高标签」。
  *
@@ -21,6 +21,23 @@ const DIST = path.join(ROOT, 'dist', 'm-team-actress-height.user.js');
 let DOC = null;
 
 /* ============================ 迷你 DOM ============================ */
+// 模拟浏览器 querySelectorAll 的返回值：有 length / 数字索引 / forEach / [Symbol.iterator]，
+// 但没有 concat / map / slice / filter —— 真实 NodeList 同样没有这些方法。
+class MockNodeList {
+    constructor(items) {
+        items.forEach((it, i) => { this[i] = it; });
+        this.length = items.length;
+    }
+    forEach(fn, thisArg) {
+        for (let i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this);
+    }
+    [Symbol.iterator]() {
+        let i = 0;
+        const self = this;
+        return { next() { return i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true }; } };
+    }
+}
+
 class Node {
     constructor(nodeType) {
         this.nodeType = nodeType;
@@ -106,27 +123,56 @@ class TextNode extends Node {
     }
 }
 
-/** 极简选择器：支持 ".class" 与 "tag[attr*=value]"，可用 "," 组合 */
-function matchesSelector(el, sel) {
-    for (const part0 of sel.split(',')) {
-        const part = part0.trim();
-        if (!part) continue;
-        const m = part.match(/^([a-zA-Z0-9]*)\[([\w-]+)\*=(["']?)(.*?)\3\]$/);
-        if (m) {
-            const [, tag, attr, , val] = m;
-            if (tag && el.tagName.toLowerCase() !== tag.toLowerCase()) continue;
+/** 复合选择器片段：#id / .class / tag / [attr*=value]，可连写 */
+function matchCompound(el, part) {
+    const re = /([#.]?[\w-]+|\[[\w-]+\*=(["']?)(.*?)\2\])/g;
+    let m;
+    let any = false;
+    while ((m = re.exec(part))) {
+        const tok = m[1];
+        any = true;
+        if (tok.startsWith('#')) {
+            if (el.id !== tok.slice(1)) return false;
+        } else if (tok.startsWith('.')) {
+            if (!el.classList.contains(tok.slice(1))) return false;
+        } else if (tok.startsWith('[')) {
+            const inner = tok.slice(1, -1);
+            const eq = inner.indexOf('*=');
+            const attr = inner.slice(0, eq);
+            const val = inner.slice(eq + 2).replace(/^["']|["']$/g, '');
             const have = el.getAttribute(attr);
-            if (have != null && have.includes(val)) return true;
-            continue;
+            if (have == null || !have.includes(val)) return false;
+        } else if (el.tagName.toLowerCase() !== tok.toLowerCase()) {
+            return false;
         }
-        if (part.startsWith('.')) {
-            if (el.classList.contains(part.slice(1))) return true;
-            continue;
+    }
+    return any;
+}
+
+/** 极简选择器：支持后代组合（"#id .class"）、同层复合、多选（","） */
+function matchesSelector(el, sel) {
+    for (const selPart of sel.split(',')) {
+        const chain = selPart.trim().split(/\s+/).filter(Boolean);
+        if (!chain.length) continue;
+        if (!matchCompound(el, chain[chain.length - 1])) continue;
+        let node = el.parentElement;
+        let ok = true;
+        for (let i = chain.length - 2; i >= 0; i--) {
+            let found = false;
+            while (node) {
+                if (matchCompound(node, chain[i])) {
+                    found = true;
+                    node = node.parentElement;
+                    break;
+                }
+                node = node.parentElement;
+            }
+            if (!found) {
+                ok = false;
+                break;
+            }
         }
-        if (/^[a-zA-Z0-9]+$/.test(part)) {
-            if (el.tagName.toLowerCase() === part.toLowerCase()) return true;
-            continue;
-        }
+        if (ok) return true;
     }
     return false;
 }
@@ -170,6 +216,7 @@ class Element extends Node {
             },
         };
         this.dataset = {};
+        this._listeners = Object.create(null);
         this.id = '';
     }
     setAttribute(k, v) {
@@ -193,7 +240,12 @@ class Element extends Node {
     set className(v) {
         this.classList._s = new Set(String(v).split(/\s+/).filter(Boolean));
     }
-    addEventListener() {}
+    addEventListener(type, fn) {
+        (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+    }
+    dispatch(type, ev) {
+        (this._listeners[type] || []).forEach((fn) => fn(ev || {}));
+    }
     descendants() {
         const out = [];
         const walk = (n) => {
@@ -206,7 +258,11 @@ class Element extends Node {
         return out;
     }
     querySelectorAll(sel) {
-        return this.descendants().filter((n) => n.nodeType === 1 && matchesSelector(n, sel));
+        // 模拟浏览器 NodeList：有 length/索引/forEach，但没有 concat/map/slice。
+        // 这样脚本若误用数组方法（如 selectorAll().concat()）会像真浏览器一样抛错。
+        return new MockNodeList(
+            this.descendants().filter((n) => n.nodeType === 1 && matchesSelector(n, sel)),
+        );
     }
     querySelector(sel) {
         return this.querySelectorAll(sel)[0] || null;
@@ -272,7 +328,7 @@ class Range {
 }
 
 /* ============================ 构造文档 ============================ */
-function buildDocument() {
+function buildDocument(opts = {}) {
     const doc = {
         nodeType: 9,
         childNodes: [],
@@ -354,6 +410,17 @@ function buildDocument() {
         maskImage: 'none',
         getPropertyValue: () => 'none',
     };
+    // 真实站点上「裁切」也常落在单元格/行上（Tailwind 的 truncate 有时挂在外层 div）。
+    // 这里把 td 和 tr 也标记成被裁切，用来验证脚本绝不会把 .mt-full-title 打到表格骨架上。
+    const clippedCell = {
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        maskImage: 'none',
+        getPropertyValue: () => 'none',
+    };
+    tdTitle._computed = clippedCell;
+    tr._computed = clippedCell;
     tdTitle.appendChild(titleLink);
     tr.appendChild(tdTitle);
     body.appendChild(tr);
@@ -366,22 +433,151 @@ function buildDocument() {
     thumb.naturalHeight = 400;
     body.appendChild(thumb);
 
+    // 懒加载中的缩略图：complete=false，数据还没到。用来验证「重复注册 load 监听器」回归。
+    const lazyThumb = new Element('img');
+    lazyThumb.setAttribute('class', 'torrent-list__thumbnail');
+    lazyThumb.setAttribute('src', 'https://example.com/thumb-lazy.jpg');
+    lazyThumb.complete = false;
+    lazyThumb.naturalWidth = 0;
+    lazyThumb.naturalHeight = 0;
+    body.appendChild(lazyThumb);
+
+    // manyClipped：模拟无限滚动后一次加载进来的多行截断标题。
+    // 用来验证 applyFullTitles 是「先集中检测、再集中加类」，而不是检测一个加一个。
+    const clipped = [];
+    if (opts.manyClipped) {
+        for (let i = 0; i < opts.manyClipped; i++) {
+            const row = new Element('tr');
+            const cell = new Element('td');
+            const a = mk('a', { href: '/detail/80' + i }, 'SSIS-20' + i + ' 三上悠亜 很长的标题会被截断');
+            a._computed = {
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                maskImage: 'none',
+                getPropertyValue: () => 'none',
+            };
+            cell.appendChild(a);
+            row.appendChild(cell);
+            body.appendChild(row);
+            clipped.push(a);
+        }
+    }
+
+    // ---- 订阅页夹具：/showcase?action=fav 的女优卡片 ----
+    // 结构照抄前端 showcase chunk：图片链接（无文本）+ 名字链接（有文本）
+    const showcase = new Element('div');
+    showcase.setAttribute('class', 'showcase-grid-list');
+    // cardHref 可切换卡片详情页路径，用来验证站点改版后 DOM 解析是否还命中
+    const cardBase = opts.cardHref || '/showcaseDetail';
+    const mkCard = (name, id) => {
+        const card = new Element('div');
+        card.setAttribute('class', 'group flex flex-col rounded-xl');
+        // cardNoLink：真实站点上卡片不是 <a>（诊断里 hrefs 全是导航链接，一张卡片链接都没有）
+        const tag = opts.cardNoLink ? 'div' : 'a';
+        const attrs = opts.cardNoLink ? {} : { href: `${cardBase}?id=${id}` };
+        const picLink = new Element(tag);
+        if (attrs.href) picLink.setAttribute('href', attrs.href);
+        const img = new Element('img');
+        img.setAttribute('alt', name); // 真实页面：图片无文本，靠 alt 兜底
+        picLink.appendChild(img);
+        card.appendChild(picLink);
+        card.appendChild(mk(tag, attrs, name));
+        return card;
+    };
+    // noCards：卡片还没渲染出来的场景，校验「点按钮给提示、不误写缓存」
+    if (!opts.noCards) {
+        showcase.appendChild(mkCard('三上悠亜', 101));
+        showcase.appendChild(mkCard('葵つかさ', 102));
+    }
+
+    // 可选：模拟 /showcase 的三个 Tab（首页 all / 我的 my / 收藏 fav）
+    if (opts.activeTab) {
+        const tabs = new Element('div');
+        tabs.setAttribute('class', 'ant-tabs');
+        for (const key of ['all', 'my', 'fav']) {
+            const t = new Element('div');
+            t.setAttribute(
+                'class',
+                key === opts.activeTab ? 'ant-tabs-tab ant-tabs-tab-active' : 'ant-tabs-tab',
+            );
+            t.setAttribute('data-node-key', key);
+            tabs.appendChild(t);
+        }
+        const pane = new Element('div');
+        pane.setAttribute('class', 'ant-tabs-tabpane ant-tabs-tabpane-active');
+        // cardOutsidePane：实测站点把收藏列表渲染在 antd pane 之外，pane 里一张卡都没有
+        if (!opts.cardOutsidePane) pane.appendChild(showcase);
+        tabs.appendChild(pane);
+        body.appendChild(tabs);
+        if (opts.cardOutsidePane) body.appendChild(showcase);
+    } else {
+        body.appendChild(showcase);
+    }
+
     DOC = doc;
-    return { doc, a1, a2, a3, a4, a5, div, titleLink, thumb };
+    return { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, showcase, clipped };
 }
 
 /* ============================ 执行脚本 ============================ */
-function run() {
+function run(opts = {}) {
     if (!fs.existsSync(DIST)) {
         console.error(`缺少构建产物：${DIST}\n请先运行 node tools/build-userscript.mjs`);
         process.exit(1);
     }
-    const { doc, a1, a2, a3, a4, a5, div, titleLink, thumb } = buildDocument();
+    const { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped } = buildDocument(opts);
+    // 模拟「首屏还在加载」：脚本应当推迟动手，避免打断站点首次渲染
+    if (opts.readyState) doc.readyState = opts.readyState;
 
-    const store = new Map();
+    const store = new Map(Object.entries(opts.storage || {}));
+    const pageWindow = opts.href
+        ? { location: { href: opts.href, hostname: new URL(opts.href).hostname } }
+        : {};
+    if (opts.siteXhr) pageWindow.XMLHttpRequest = opts.siteXhr;
+    if (opts.siteFetch) pageWindow.fetch = opts.siteFetch;
+
+    // window 事件：脚本会监听 scroll（滚动期间推迟缩略图缩放）/ storage / focus
+    const winListeners = Object.create(null);
+    pageWindow.addEventListener = (type, fn) => {
+        (winListeners[type] || (winListeners[type] = [])).push(fn);
+    };
+    pageWindow.removeEventListener = () => {};
+    pageWindow.fire = (type, ev) => {
+        (winListeners[type] || []).forEach((fn) => {
+            try { fn(ev || {}); } catch (e) { /* ignore */ }
+        });
+    };
+    pageWindow.listenerCount = (type) => (winListeners[type] || []).length;
+
+    // 定时器队列：测试里默认不自动执行（否则 boot 的兜底 scanAll 会打乱断言），
+    // 需要时手动 drainTimers()。用于验证「滚动停止后才缩放缩略图」的延迟逻辑。
+    const timers = [];
+    let timerSeq = 0;
+    const setTimeoutImpl = (fn, ms) => {
+        timerSeq += 1;
+        timers.push({ id: timerSeq, fn, ms: ms || 0 });
+        return timerSeq;
+    };
+    const clearTimeoutImpl = (id) => {
+        const i = timers.findIndex((x) => x.id === id);
+        if (i >= 0) timers.splice(i, 1);
+    };
+    const drainTimers = () => {
+        let guard = 0;
+        while (timers.length && guard < 50) {
+            guard += 1;
+            timers.splice(0).forEach((x) => {
+                try { x.fn(); } catch (e) { /* ignore */ }
+            });
+        }
+    };
+
     const sandbox = {
         document: doc,
-        window: {},
+        window: pageWindow,
+        URL,
+        TextEncoder,
+        crypto: opts.crypto,
         localStorage: {
             getItem: (k) => (store.has(k) ? store.get(k) : null),
             setItem: (k, v) => store.set(k, String(v)),
@@ -391,17 +587,29 @@ function run() {
             disconnect() {}
         },
         NodeFilter: { SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3 },
-        getComputedStyle: (el) =>
-            (el && el._computed) || {
+        // onStyleRead：记录每次 getComputedStyle 调用（用于验证「读」「写」没有交错）
+        getComputedStyle: (el) => {
+            if (opts.onStyleRead) opts.onStyleRead(el, doc);
+            return (el && el._computed) || {
                 whiteSpace: 'normal',
                 overflow: 'visible',
                 textOverflow: 'clip',
                 maskImage: 'none',
                 getPropertyValue: () => 'none',
-            },
-        setTimeout: () => 0,
-        clearTimeout: () => {},
-        console,
+            };
+        },
+        setTimeout: setTimeoutImpl,
+        clearTimeout: clearTimeoutImpl,
+        // 缩略图缩放用 rAF 批量处理；测试里同步执行以便断言结果（真实浏览器是下一帧）
+        requestAnimationFrame: (fn) => { fn(); return 1; },
+        fetch: opts.fetch, // undefined 时脚本会走「没有可用请求方式」分支
+        // 默认吞掉失败诊断的 warn，保持测试输出干净；quiet 时连 log/error 也静默。
+        // onWarn / onLog：把脚本的 console 输出抓出来断言（性能自诊断就靠它）
+        console: {
+            log: opts.onLog || (opts.quiet ? function () {} : console.log),
+            warn: opts.onWarn || function () {},
+            error: opts.quiet ? function () {} : console.error,
+        },
     };
     sandbox.document.documentElement = doc.documentElement;
     vm.createContext(sandbox);
@@ -409,7 +617,12 @@ function run() {
     const code = fs.readFileSync(DIST, 'utf8');
     vm.runInContext(code, sandbox, { filename: 'm-team-actress-height.user.js' });
 
-    return { a1, a2, a3, a4, a5, div, titleLink, thumb, doc };
+    return {
+        a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, doc, store,
+        siteXhr: opts.siteXhr,
+        pageWindow,
+        drainTimers,
+    };
 }
 
 /* ============================ 断言 ============================ */
@@ -433,11 +646,12 @@ function render(el) {
 }
 
 function badgeTexts(el) {
-    return el.querySelectorAll('.mt-height-badge').map((b) => b.textContent);
+    return Array.prototype.slice.call(el.querySelectorAll('.mt-height-badge'))
+        .map((b) => b.textContent);
 }
 
 console.log('--- DOM 集成测试（真实执行构建产物）---');
-const { a1, a2, a3, a4, a5, div, titleLink, thumb, doc } = run();
+const { a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, doc } = run();
 
 t('标题 1：三上悠亜 后面插入 159cm', () => {
     console.log(`      ${render(a1)}`);
@@ -488,18 +702,101 @@ t('合并：注入了放开截断的样式 <style id="mt-full-title-style">', ()
     assert.ok(/white-space:\s*normal/.test(styleEl.textContent));
 });
 
+t('性能：放开截断的 CSS 不得用 overflow-wrap: anywhere（会让表格列宽计算爆炸）', () => {
+    const styleEl = doc.getElementById('mt-full-title-style');
+    assert.ok(!/overflow-wrap:\s*anywhere/.test(styleEl.textContent),
+        'anywhere 会把最小内容宽度算成一个字符；table-layout:auto 的几千行表格每次算列宽都要重算，'
+        + '实测把主线程堵 1 秒以上。应改用 break-word');
+    assert.ok(/overflow-wrap:\s*break-word/.test(styleEl.textContent), '应使用 break-word');
+});
+
+t('性能：截断放开绝不能把类打在 tr/td 上（`.mt-full-title *` 会波及整行甚至整个 tbody）', () => {
+    const cell = titleLink.parentElement;      // td
+    const row = cell && cell.parentElement;    // tr
+    assert.ok(cell && row, '夹具结构不对：标题应在 tr > td 里');
+    assert.ok(titleLink.classList.contains('mt-full-title'), '标题本身应被标记');
+    assert.ok(!cell.classList.contains('mt-full-title'), 'td 不该被标记（会让整格的元素都被 !important 覆盖）');
+    assert.ok(!row.classList.contains('mt-full-title'), 'tr 不该被标记（会让整行的元素都被 !important 覆盖）');
+});
+
+{
+    // 排障开关：卡顿时用 localStorage.mt_off 逐个关功能来定位
+    const offTitle = run({ storage: { mt_off: 'title' }, quiet: true });
+    t('排障开关：mt_off=title 时完全不放开标题（定位卡顿来源用）', () => {
+        assert.ok(!offTitle.doc.getElementById('mt-full-title-style'), '不该注入放开截断的样式');
+        assert.ok(!offTitle.titleLink.classList.contains('mt-full-title'), '不该加标记类');
+        assert.deepStrictEqual(badgeTexts(offTitle.a1), [' 159cm'], '身高标签不该受影响');
+    });
+
+    const offThumb = run({ storage: { mt_off: 'thumb' }, quiet: true });
+    t('排障开关：mt_off=thumb 时不动缩略图尺寸', () => {
+        assert.strictEqual(offThumb.thumb.style.getPropertyValue('width'), '');
+        assert.strictEqual(offThumb.thumb.style.getPropertyValue('height'), '');
+        assert.strictEqual(offThumb.thumb.dataset.mtFitSize, undefined);
+    });
+
+    const offBadge = run({ storage: { mt_off: 'badge' }, quiet: true });
+    t('排障开关：mt_off=badge 时不插身高标签', () => {
+        assert.deepStrictEqual(badgeTexts(offBadge.a1), []);
+        // 其它功能仍在：截断放开照旧
+        assert.ok(offBadge.titleLink.classList.contains('mt-full-title'));
+    });
+
+    const offAll = run({ storage: { mt_off: 'all' }, quiet: true });
+    t('排障开关：mt_off=all 一次关掉三个功能（判断是否我们引起的关键对照）', () => {
+        assert.deepStrictEqual(badgeTexts(offAll.a1), [], '身高标签没关掉');
+        assert.ok(!offAll.doc.getElementById('mt-full-title-style'), '标题放开没关掉');
+        assert.strictEqual(offAll.thumb.style.getPropertyValue('width'), '', '缩略图缩放没关掉');
+    });
+}
+
 t('合并：缩略图按短边 240px 等比缩放（竖图取宽）', () => {
+    // 300×400 竖图 → 短边是宽：宽 240，高按比例 240*400/300 = 320（写死像素，不用 auto）
     assert.strictEqual(thumb.style.getPropertyValue('width'), '240px');
-    assert.strictEqual(thumb.style.getPropertyValue('height'), 'auto');
+    assert.strictEqual(thumb.style.getPropertyValue('height'), '320px');
     assert.strictEqual(thumb.dataset.mtFitSize, '240');
 });
+
+t('性能：懒加载缩略图不会被重复注册 load 监听器（累积会导致图片加载时卡死）', () => {
+    const countLoad = () => (lazyThumb._listeners.load || []).length;
+    assert.strictEqual(countLoad(), 1, 'boot 后应恰好注册 1 个 load 监听器');
+    // 反复切换尺寸会反复调用 applyListThumbSize；未加载的图不应被重复注册
+    for (const size of ['360', '480', '240']) {
+        const btn = doc.querySelector('#mt-height-panel .mt-big-size-btn[data-size="' + size + '"]')
+            || Array.prototype.slice.call(doc.querySelectorAll('.mt-big-size-btn'))
+                .find((b) => b.dataset.size === size);
+        if (btn) btn.dispatch('click');
+    }
+    assert.strictEqual(
+        countLoad(), 1,
+        '多次重绘后 load 监听器应仍为 1 个，实际 ' + countLoad() + ' 个（每次扫描累积一个 → 图片加载时批量回调卡死）',
+    );
+});
+
+{
+    // 懒加载图加载完成后，load 回调把图入队并批量缩放（rAF）；验证最终尺寸正确
+    const sub = run({ quiet: true });
+    const lazy = sub.lazyThumb;
+    lazy.complete = true;
+    lazy.naturalWidth = 400;
+    lazy.naturalHeight = 300;
+    (lazy._listeners.load || []).forEach((fn) => fn());
+    // 测试沙箱的 requestAnimationFrame 同步执行，入队即 flush，无需等待
+
+    t('性能：懒加载图加载完成后能正确缩放（入队批量处理）', () => {
+        // 400×300 横图 → 短边是高：高 240，宽 240*400/300 = 320
+        assert.strictEqual(lazy.style.getPropertyValue('height'), '240px');
+        assert.strictEqual(lazy.style.getPropertyValue('width'), '320px');
+        assert.strictEqual(lazy.dataset.mtFitSize, '240');
+    });
+}
 
 t('合并：右下角为统一面板（含身高开关 + 大图尺寸按钮）', () => {
     const panel = doc.getElementById('mt-height-panel');
     assert.ok(panel, '未找到统一面板');
     assert.ok(panel.textContent.includes('女优身高'), '缺少身高开关');
     assert.ok(panel.textContent.includes('大图'), '缺少大图尺寸标签');
-    const btns = panel.querySelectorAll('.mt-big-size-btn');
+    const btns = Array.prototype.slice.call(panel.querySelectorAll('.mt-big-size-btn'));
     assert.strictEqual(btns.length, 3);
     assert.ok(btns.some((b) => b.classList.contains('mt-active')), '默认尺寸按钮未高亮');
 });
@@ -508,6 +805,413 @@ t('合并：身高标签不会被误标记为 mt-full-title', () => {
     titleLink.querySelectorAll('.mt-height-badge').forEach((b) => {
         assert.ok(!b.classList.contains('mt-full-title'));
     });
+});
+
+/* ---------------- 订阅：本地缓存 + 点按钮才读，零网络请求 ---------------- */
+const tick = (ms) => new Promise((res) => setTimeout(res, ms));
+
+// 一个「一定不会被调用」的 fetch：脚本若发任何网络请求就记录并保持静默
+function noNetworkFetch(calls = []) {
+    return (url, init) => {
+        calls.push({ url, init });
+        return Promise.resolve({ ok: false, status: 503, text: async () => '' });
+    };
+}
+
+const CACHED_NAMES = ['三上悠亜', '葵つかさ'];
+const CACHED_SUB = JSON.stringify({
+    ts: Date.now(), names: CACHED_NAMES, total: 2, source: 'dom',
+});
+
+{
+    // 有缓存：启动时秒开，名单与标签都恢复，且全程零网络请求
+    const calls = [];
+    const sub = run({ fetch: noNetworkFetch(calls), storage: { mt_subscribed_actresses: CACHED_SUB } });
+    await tick(50);
+
+    t('订阅：启动只读缓存恢复名单，不发任何网络请求', () => {
+        assert.strictEqual(calls.length, 0, '脚本发了网络请求：' + JSON.stringify(calls.map((c) => c.url)));
+    });
+
+    t('订阅：命中订阅女优的标题末尾追加「已订阅」', () => {
+        console.log(`      ${render(sub.a1)}`);
+        const badges = sub.a1.querySelectorAll('.mt-sub-badge');
+        assert.strictEqual(badges.length, 1);
+        assert.strictEqual(badges[0].textContent, '已订阅');
+        assert.strictEqual(sub.a1.childNodes[sub.a1.childNodes.length - 1], badges[0]);
+        assert.deepStrictEqual(badgeTexts(sub.a1), [' 159cm']);
+    });
+
+    t('订阅：另一位订阅女优同样命中（葵つかさ）', () => {
+        assert.strictEqual(sub.a2.querySelectorAll('.mt-sub-badge').length, 1);
+    });
+
+    t('订阅：无命中的标题不加「已订阅」标签', () => {
+        assert.strictEqual(sub.a4.querySelectorAll('.mt-sub-badge').length, 0);
+    });
+
+    t('订阅：一条标题命中多个女优时只加一个「已订阅」，且在最后', () => {
+        const badges = sub.a5.querySelectorAll('.mt-sub-badge');
+        assert.strictEqual(badges.length, 1);
+        assert.strictEqual(sub.a5.childNodes[sub.a5.childNodes.length - 1], badges[0]);
+    });
+
+    t('订阅：面板按钮显示缓存里的数量（已订阅 2）', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.ok(btn, '缺少订阅按钮');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+        assert.ok(btn.classList.contains('mt-sub-on'));
+    });
+}
+
+{
+    // 无缓存：启动按钮为 0，不发请求；点一次按钮 → 弹提示引导去订阅页
+    const calls = [];
+    const sub = run({ fetch: noNetworkFetch(calls) });
+    await tick(50);
+
+    t('订阅：无缓存时启动显示「已订阅 0」，不发请求', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 0');
+        assert.strictEqual(calls.length, 0, '启动时发了网络请求');
+    });
+
+    sub.doc.querySelector('#mt-height-panel .mt-sub-btn').dispatch('click');
+    await tick(30);
+
+    t('订阅：名单为 0 时点按钮提示去订阅页，且仍不发请求', () => {
+        assert.strictEqual(calls.length, 0, '点按钮发了网络请求');
+        const toast = sub.doc.querySelector('#mt-sub-toast');
+        assert.ok(toast, '没有弹出提示');
+        assert.ok(/女优订阅页|showcase/.test(toast.textContent), '提示里应指向订阅页：' + toast.textContent);
+        const link = toast.querySelector('a');
+        assert.ok(link, '提示里应有跳转链接');
+        assert.ok(/showcase\?action=fav/.test(link.getAttribute('href')));
+    });
+}
+
+/* ---------------- 订阅页 DOM（/showcase?action=fav）：点按钮才读 ---------------- */
+const clickSub = (sub) => sub.doc.querySelector('#mt-height-panel .mt-sub-btn').dispatch('click');
+
+{
+    // 收藏页：启动不自动读（按钮仍为 0），点一次按钮才从 DOM 读出名单
+    const calls = [];
+    const sub = run({ href: 'https://kp.m-team.cc/showcase?action=fav', fetch: noNetworkFetch(calls) });
+    await tick(50);
+
+    t('订阅页：启动不自动读 DOM，按钮仍为「已订阅 0」', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 0');
+        assert.strictEqual(calls.length, 0, '启动发了网络请求');
+    });
+
+    clickSub(sub);
+    await tick(30);
+
+    t('订阅页：点一次按钮后从页面 DOM 读出名单并标记', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+        assert.strictEqual(sub.a1.querySelectorAll('.mt-sub-badge').length, 1, 'a1 应标记「已订阅」');
+        assert.strictEqual(sub.a2.querySelectorAll('.mt-sub-badge').length, 1, 'a2 应标记「已订阅」');
+    });
+
+    t('订阅页：读到的名单写入缓存，图片 alt 与名字链接去重', () => {
+        const raw = sub.store.get('mt_subscribed_actresses');
+        assert.ok(raw, '没有写入缓存');
+        const obj = JSON.parse(raw);
+        assert.strictEqual(obj.source, 'dom');
+        assert.deepStrictEqual([...obj.names].sort(), ['三上悠亜', '葵つかさ'].sort());
+        assert.strictEqual(calls.length, 0, '点按钮发了网络请求');
+    });
+}
+
+{
+    // 不在收藏页：页面上虽然有卡片夹具，点按钮也不把它当成订阅名单
+    const sub = run({ href: 'https://kp.m-team.cc/browse' });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('DOM：不在收藏页时点按钮也不从页面取名字（不误把当前页当订阅）', () => {
+        assert.strictEqual(sub.a1.querySelectorAll('.mt-sub-badge').length, 0);
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 0');
+    });
+}
+
+/* ---------------- Tab 区分：首页 / 我的 / 收藏 ---------------- */
+{
+    // 首页 tab 激活，但 URL 还残留 action=fav（SPA 切 tab 时常见）
+    const sub = run({ href: 'https://kp.m-team.cc/showcase?action=fav', activeTab: 'all' });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('TAB：首页（all）激活时不把整页女优当订阅，即使 URL 带 action=fav', () => {
+        assert.strictEqual(sub.a1.querySelectorAll('.mt-sub-badge').length, 0);
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 0');
+        assert.ok(!sub.store.get('mt_subscribed_actresses'), '不该写入订阅缓存');
+    });
+}
+
+{
+    // 收藏 tab 激活、URL 却没有 action=fav（切 tab 后 URL 未更新）
+    const sub = run({ href: 'https://kp.m-team.cc/showcase', activeTab: 'fav' });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('TAB：收藏（fav）激活时即使 URL 没有 action=fav 也能读取', () => {
+        assert.strictEqual(sub.a1.querySelectorAll('.mt-sub-badge').length, 1);
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+    });
+}
+
+{
+    // 实测结构第一步：卡片渲染在激活 pane 之外（pane 里一张没有），要能退回整页
+    const sub = run({
+        href: 'https://kp.m-team.cc/showcase?action=fav',
+        activeTab: 'fav',
+        cardOutsidePane: true,
+        quiet: true,
+    });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('DOM：卡片渲染在激活 pane 之外时，退回整页抓取', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+    });
+}
+
+{
+    // 实测结构完整复刻：pane 里没卡片 + 卡片不是链接（hrefs 全是导航），只剩 img alt 可用
+    const sub = run({
+        href: 'https://kp.m-team.cc/showcase?action=fav',
+        activeTab: 'fav',
+        cardOutsidePane: true,
+        cardNoLink: true,
+        quiet: true,
+    });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('DOM：复刻实测结构（pane 空 + 卡片非链接）仍能读到', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+    });
+}
+
+{
+    // 站点把详情页路径改成 /showcase/xxx
+    const sub = run({
+        href: 'https://kp.m-team.cc/showcase?action=fav',
+        cardHref: '/showcase/person',
+        quiet: true,
+    });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('DOM：卡片路径改成 /showcase/... 后仍能读取', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+    });
+}
+
+{
+    // 路径完全不认识，但只要卡片图片 alt 在，也要能兜住
+    const sub = run({
+        href: 'https://kp.m-team.cc/showcase?action=fav',
+        cardHref: '/person',
+        quiet: true,
+    });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('DOM：链接路径完全不认识时，用卡片图片 alt 兜底', () => {
+        const btn = sub.doc.querySelector('#mt-height-panel .mt-sub-btn');
+        assert.strictEqual(btn.textContent, '已订阅 2');
+    });
+}
+
+{
+    // 卡片还没渲染出来（订阅页无卡片夹具）：点按钮给提示，不写缓存、不发请求
+    const calls = [];
+    const sub = run({
+        href: 'https://kp.m-team.cc/showcase?action=fav',
+        noCards: true,
+        fetch: noNetworkFetch(calls),
+        quiet: true,
+    });
+    await tick(50);
+    clickSub(sub);
+    await tick(30);
+
+    t('订阅页：卡片还没出来时点按钮提示稍后再点，不发请求也不写缓存', () => {
+        assert.strictEqual(calls.length, 0, '发了网络请求');
+        const toast = sub.doc.querySelector('#mt-sub-toast');
+        assert.ok(toast, '没有弹出提示');
+        assert.ok(/再点一次/.test(toast.textContent), '提示应引导稍后再点：' + toast.textContent);
+        assert.ok(!sub.store.get('mt_subscribed_actresses'), '不该写入空缓存');
+    });
+}
+
+/* ---------------- 性能回归：缩略图缩放必须批量、读写分离、滚动期间不落地 ---------------- */
+{
+    // 滚动中加载完的图：只入队，不在滚动帧里改尺寸（改尺寸会让整张表格重新布局）
+    const r = run({ quiet: true });
+    r.pageWindow.fire('scroll'); // 模拟用户正在滚
+    r.lazyThumb.complete = true;
+    r.lazyThumb.naturalWidth = 300;
+    r.lazyThumb.naturalHeight = 200;
+    r.lazyThumb.dispatch('load');
+
+    t('性能：滚动期间不立即改缩略图尺寸（避免滚动中反复全表重排）', () => {
+        assert.strictEqual(r.lazyThumb.style._props.height, undefined,
+            '滚动进行中就把高度写上去了，会导致每张图一次全表重排');
+    });
+
+    await tick(200); // 等过 FIT_IDLE_MS
+    r.drainTimers();
+
+    t('性能：滚动停止后一次性补做缩放', () => {
+        assert.strictEqual(r.lazyThumb.style._props.height, '240px');
+        assert.strictEqual(r.lazyThumb.style._props.width, '360px');
+    });
+}
+
+{
+    // 无限滚动一次加载进来多行被截断的标题：检测必须全部做完才加类。
+    // 边检测边加类时，每次加类都会让样式失效，下一次 getComputedStyle 又触发全量重算，
+    // 几百行就是幾百次全页样式重算 —— 这正是"滚多一点就卡"的元凶。
+    const reads = [];
+    const r = run({
+        manyClipped: 4,
+        quiet: true,
+        onStyleRead: (el, d) => {
+            reads.push(d.querySelectorAll('.mt-full-title').length);
+        },
+    });
+
+    t('性能：applyFullTitles 先集中检测再集中加类（读写不交错）', () => {
+        assert.ok(reads.length >= 4, '样式读取次数太少，用例没覆盖到检测过程：' + reads.length);
+        assert.strictEqual(Math.max.apply(null, reads), 0,
+            '检测阶段就有元素被加了 .mt-full-title，说明读和写交错了：' + JSON.stringify(reads));
+        // 功能不能退化：多行截断标题仍要全部放开
+        const marked = r.clipped.filter((a) => a.classList.contains('mt-full-title'));
+        assert.strictEqual(marked.length, r.clipped.length, '被截断的标题没有全部放开');
+    });
+}
+
+t('性能：缩略图缩放入队 + 滚动门控，flush 先读后写（结构断言）', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'userscript.template.js'), 'utf8');
+    const start = src.indexOf('function applyListThumbSize()');
+    assert.ok(start >= 0, '找不到 applyListThumbSize');
+    const block = src.slice(start, src.indexOf('\n}', start));
+    // load 回调必须入队，不能在回调里直接 setProperty（会造成每张图一次强制布局）
+    assert.ok(/addEventListener\('load',\s*\(\)\s*=>\s*enqueueFit\(img\)/.test(block),
+        'load 回调必须调用 enqueueFit 入队，而不是直接读写样式');
+    assert.ok(!/addEventListener\('load'[\s\S]{0,200}setProperty/.test(block),
+        'load 回调里不得直接 setProperty');
+
+    // 滚动门控：记录滚动时间，滚动没停就先不落地
+    assert.ok(/addEventListener\('scroll'[\s\S]{0,140}_lastScrollAt\s*=\s*Date\.now\(\)/.test(src),
+        '必须监听 scroll 记录滚动时间，才能在滚动期间推迟缩放');
+    const runStart = src.indexOf('function runFitFlush()');
+    assert.ok(runStart >= 0, '找不到 runFitFlush');
+    const runBody = src.slice(runStart, src.indexOf('\n}', runStart));
+    const idleIdx = runBody.indexOf('FIT_IDLE_MS');
+    const flushIdx = runBody.indexOf('flushFitQueue()');
+    assert.ok(idleIdx >= 0 && flushIdx > idleIdx,
+        '必须先判断滚动是否已停止，再执行 flushFitQueue');
+
+    // flush 必须先集中读 naturalWidth 再集中写（两段式，避免 layout thrashing）
+    const flushStart = src.indexOf('function flushFitQueue()');
+    assert.ok(flushStart >= 0, '找不到 flushFitQueue');
+    const flushBody = src.slice(flushStart, src.indexOf('\n}\n', flushStart));
+    const readIdx = flushBody.indexOf('naturalWidth');
+    const writeIdx = flushBody.indexOf('setProperty');
+    assert.ok(readIdx >= 0 && writeIdx >= 0 && readIdx < writeIdx,
+        'flush 必须先读完所有尺寸，再统一写样式');
+});
+
+{
+    // 首屏还在加载（React 正在 hydration）时不能动手改 DOM，否则打断站点首次渲染。
+    // 用 interactive 模拟真实时序：boot 在 DOMContentLoaded 就跑了，但首屏还没渲染完。
+    const r = run({ readyState: 'interactive', quiet: true });
+
+    t('首屏：页面还在加载时不插身高标签（避免打断站点首次渲染）', () => {
+        assert.deepStrictEqual(badgeTexts(r.a1), [], '加载阶段不该插标签');
+        assert.ok(!r.doc.getElementById('mt-full-title-style'), '加载阶段不该注入放开截断的样式');
+    });
+
+    r.doc.readyState = 'complete';
+    r.pageWindow.fire('load');
+    r.drainTimers();
+
+    t('首屏：页面加载完成后立即补上标签', () => {
+        assert.deepStrictEqual(badgeTexts(r.a1), [' 159cm']);
+        assert.ok(r.doc.getElementById('mt-full-title-style'), '加载完成后应注入放开截断的样式');
+    });
+}
+
+t('性能：applyFullTitles 是「登记 → 集中读 → 集中写」三段式（结构断言）', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'userscript.template.js'), 'utf8');
+    const start = src.indexOf('function applyFullTitles()');
+    assert.ok(start >= 0, '找不到 applyFullTitles');
+    const body = src.slice(start, src.indexOf('\n}\n', start));
+    const probe = body.indexOf('isClippedElement(fresh[i])');
+    const write = body.indexOf('classList.add(FULL_TITLE_CLASS)');
+    assert.ok(probe >= 0 && write > probe, '必须先完成全部检测，再统一加类');
+    const loop = body.slice(body.indexOf('const clipped = [];'), write);
+    assert.ok(!/classList\.add/.test(loop), '检测阶段不得同时加类');
+});
+
+/* ---------------- 性能回归：processElement 不得逐字符分配对象 ---------------- */
+t('性能：processElement 的签名早退在惰性映射之前，不逐字符建对象', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'userscript.template.js'), 'utf8');
+    const start = src.indexOf('function processElement(el)');
+    assert.ok(start >= 0, '找不到 processElement');
+    const body = src.slice(start, src.indexOf('\n}', start));
+    const earlyReturn = body.indexOf("=== sig) return");
+    const spansDecl = body.indexOf('const spans = []');
+    assert.ok(earlyReturn >= 0, '找不到签名早退');
+    assert.ok(spansDecl >= 0, '找不到惰性的 spans 映射');
+    assert.ok(
+        earlyReturn < spansDecl,
+        '签名早退必须在构建字符映射之前，否则每个已处理标题仍会逐字符分配对象（GC 抖动/假死）',
+    );
+    // 不能再出现 per-character 的 {node, off} 分配
+    assert.ok(
+        !/for\s*\([^)]*\)\s*anchors\.push\(/.test(body),
+        '不得为每个字符 push 一个对象',
+    );
+});
+
+/* ---------------- 误装模板的防护 ---------------- */
+t('误装模板（未构建）时给出可读提示并安全退出，不抛 ReferenceError', () => {
+    const errors = [];
+    const sandbox = {
+        console: { error: (m) => errors.push(String(m)), log() {}, warn() {} },
+        window: {},
+        document: {},
+        localStorage: { getItem: () => null, setItem() {} },
+        setTimeout: () => 0,
+        clearTimeout: () => {},
+    };
+    vm.createContext(sandbox);
+    const tpl = fs.readFileSync(path.join(ROOT, 'src', 'userscript.template.js'), 'utf8');
+    assert.doesNotThrow(() => vm.runInContext(tpl, sandbox));
+    assert.ok(
+        errors.some((m) => m.includes('未构建的模板')),
+        '没有输出「未构建的模板」提示',
+    );
 });
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

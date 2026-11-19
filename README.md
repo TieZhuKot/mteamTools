@@ -1,19 +1,4 @@
-# 油猴脚本集合（Tampermonkey Userscripts）
-
-个人编写 / 收集的 Tampermonkey 油猴脚本集合。每个脚本独立成节，可单独安装、单独维护，
-后续新增的脚本会继续补充到下面的列表与章节里。
-
-## 脚本列表
-
-| 脚本 | 安装入口 | 说明 |
-|------|----------|------|
-| m-team 女优身高标注 + 列表大图 | [`dist/m-team-actress-height.user.js`](dist/m-team-actress-height.user.js) | 在 m-team 种子列表标题里给女优名追加身高，并增强列表大图 / 完整标题 |
-
-> 部分脚本的「列表大图」等能力移植自第三方（见各章节末的致谢），均为 MIT 许可。
-
----
-
-## m-team 女优身高标注 + 列表大图
+﻿# M-Team 女优身高标注 + 列表大图（油猴脚本）
 
 在 m-team 种子列表/详情页标题里的女优名字后面追加身高，例如：
 
@@ -27,10 +12,16 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
 - **种子名完整显示**：被省略号 / line-clamp 截断的种子名自动放开，不再截断；
 - **旧版界面 DMM 处理**：旧版 NexusPHP 界面下替换 DMM 缩略图并修正表格宽度。
 
-身高数据来自 DMM / FANZA 公开的演员库（`ActressSearch` API，即 joyu.sexy 等站点的数据来源），
-抓取后**内嵌进脚本**，运行时不需要联网、不发送任何请求。
+另外还会读取 M-Team「女优展示」里的**订阅（收藏）名单**：标题里出现已订阅的女优时，
+在这一条最后面追加一个绿色标签 **「已订阅」**（详见下方「订阅」）。
 
-### 快速开始
+身高数据来自 DMM / FANZA 公开的演员库（`ActressSearch` API，即 joyu.sexy 等站点的数据来源），
+抓取后**内嵌进脚本**。**脚本运行时完全不发网络请求**：身高标注用内嵌数据，
+订阅名单由你在订阅页点按钮时从页面读取（详见下方「订阅」）。
+
+---
+
+## 快速开始
 
 1. 运行构建（需要 Node.js 18+，依赖全局 `fetch`）：
 
@@ -42,6 +33,10 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
    node tools/build-userscript.mjs
    ```
 
+   > **改脚本前先升 `@version`。** `build-userscript.mjs` 会比对上次构建的快照
+   > （`build/build-snapshot.json`）：内容变了却没升版本号时会**直接构建失败**并提示。
+   > 这是为了让已装用户能收到 Tampermonkey 的更新提示——同版本号覆盖发布，用户拿不到改动。
+
 2. 安装 `dist/m-team-actress-height.user.js` 到 Tampermonkey。
 
 3. 打开 m-team 的浏览 / 搜索列表页即可看到身高标签，以及放大后的缩略图与完整种子名。
@@ -49,7 +44,9 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
 
 > 不想自己抓数据？直接使用仓库里已构建好的 `dist/m-team-actress-height.user.js` 即可。
 
-### 目录结构
+---
+
+## 目录结构
 
 ```
 ├── src/
@@ -57,22 +54,23 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
 │   └── userscript.template.js      # 油猴脚本模板（身高标注 + 列表大图，含数据/核心逻辑占位符）
 ├── tools/
 │   ├── fetch-actress-height.mjs    # 抓取 DMM 演员库 -> build/actress-height.json
-│   ├── fetch-avjoyudb-height.mjs   # 抓取 av-joyu-db.com -> build/avjoyudb-cache.json
-│   ├── fetch-warashi-height.mjs    # 抓取 warashi-asian-pornstars.fr
-│   ├── fetch-wikidata-height.mjs   # 抓取 Wikidata
-│   ├── merge-height-data.mjs       # 合并多个来源的身高数据
 │   ├── build-userscript.mjs        # 注入数据集 -> dist/xxx.user.js
 │   ├── test-matching.mjs           # 匹配逻辑单元测试
 │   ├── test-dom.mjs                # 迷你 DOM 集成测试（真实执行构建产物）
-│   └── test-fetch.mjs              # 抓取缓存数据检查
+│   ├── test-fav-sync.mjs           # 多标签页收藏同步回归测试（两个沙箱 = 两个标签页）
+│   └── test-mteam-big.mjs          # 「列表大图」独立测试（历史脚本 m-team-big.js）
+├── m-team-big.js                   # 原始「列表大图」独立脚本（已合并进模板，保留作参考）
 ├── build/
-│   ├── cache/                      # 抓取中间缓存（已 gitignore，支持断点续传）
-│   └── actress-height.json         # 最终数据集 { "三上悠亜": 159, ... }
+│   ├── cache/actress-raw.jsonl     # 原始记录缓存（支持断点续传）
+│   ├── actress-height.json         # 最终数据集 { "三上悠亜": 159, ... }
+│   └── build-snapshot.json         # 上次构建快照（版本号 + 内容指纹），用于强制升版本
 └── dist/
     └── m-team-actress-height.user.js   # 最终可安装脚本
 ```
 
-### 工作原理
+---
+
+## 工作原理
 
 1. **取数**：`fetch-actress-height.mjs` 分页调用 `https://api.dmm.com/affiliate/v3/ActressSearch`
    （`hits=100`、`offset` 递增、`sort=name` 保证翻页稳定），只保留 `height` 合法的记录，
@@ -84,7 +82,9 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
 4. **列表大图**：对缩略图按短边等比缩放；用 `getComputedStyle` 检测被截断的标题并打类放开。
    这几项与身高标注相互独立，在 MutationObserver 每次调度时一并处理。
 
-### 匹配规则与调参
+---
+
+## 匹配规则与调参
 
 在脚本顶部的 `OPTIONS` 中调整：
 
@@ -112,7 +112,9 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
   以免误伤；把 `requireBoundary` 设为 `false` 可命中，但误判会增加。
 - 同名女优取公开数据中出现次数最多的身高。
 
-### 列表大图
+---
+
+## 列表大图
 
 以下功能移植自 XMXM 的「m-team 列表大图」（SleazyFork #495505，MIT License），已合并进同一个脚本。
 
@@ -140,7 +142,112 @@ SSIS-001 三上悠亜 159cm 激しい中出演出
 
 > 列表大图 / 完整标题 / 旧版处理**始终生效**，与身高开关无关；身高开关只控制身高标签的显示。
 
-### 数据更新
+### 性能：滚动加载大量图片时为什么不卡
+
+列表页往下滚会一次性涌入几十上百行新 DOM。下面每一条都是踩过的真实故障，改动时不要回退：
+
+| 坑 | 后果 | 现在的做法 |
+|----|------|------------|
+| 在图片 `load` 回调里直接 `读 naturalWidth → 写 style` | 每张图一次强制同步布局，几十张同时加载就是几十次重排 | 统一进队列，`flushFitQueue()` **先集中读完所有尺寸，再集中写样式** |
+| 滚动进行中就改缩略图宽高 | 表格列宽依赖内容宽度，改一张图 = 整张表重新布局 | 监听 `scroll`，**滚动期间只入队不落地**；停止滚动 160ms 后才一次性处理（`FIT_IDLE_MS`） |
+| 检测到标题被截断就立刻加类 | `getComputedStyle` 会同步重算样式，加类又让样式失效；两者交错 → 每加一个类就重算整页 | `applyFullTitles()` 分三段：**登记候选 → 集中检测 → 集中加类** |
+| 给「标题祖先」打标记时打到了 `tr` / `td` | `.mt-full-title *` 会把 `white-space` / `overflow` 的 `!important` 套到**整行甚至整个 tbody** 的所有元素上，样式重算面积从「一个标题」变成「一整页」 | 用 `STRUCT_TAGS` 白名单排除表格骨架标签，只允许标记 `a` / `div` / `span` / `strong` 这类内容容器 |
+| CSS 用 `overflow-wrap: anywhere` | `anywhere` 会把「最小内容宽度」算成一个字符宽，`table-layout: auto` 的几千行表格每算一次列宽就要遍历全部单元格 —— 实测把主线程堵住 1 秒以上 | 一律用 `overflow-wrap: break-word`（不参与内在尺寸计算，换行效果一样） |
+
+**缩略图宽高都写成具体像素**（不用 `width: auto`）：否则布局要依赖图片的固有比例，
+图片还没解码完时浏览器可能先按占位尺寸排一次、解码后再排一次，等于两次全表重排。
+
+另外两处常被忽略的重复开销：扫描用的选择器串只拼一次（`TARGET_SELECTOR_LIST`），
+详情页专属的 `h2 span.align-middle` 查询与 5 次副标题 XPath 在列表页直接跳过。
+
+单次扫描耗时超过 150ms 时，扫描去抖会自动从 250ms 放宽到 1000ms（`scheduleScan`）：
+无限滚动会让 DOM 越来越大，固定去抖会越滚越卡。
+
+**首屏不抢主线程**：站点是 Next.js + React，页面还在 `loading` / `interactive` 时脚本不动手，
+等 `load` 之后（最多等 3 秒兜底）才插标签。原因：往标题里插 `<span>` 会打断 React 的首次渲染，
+hydration 一旦对不上，React 会把整棵树重新渲染一遍，首屏直接多出秒级阻塞。
+同理，缩略图在首屏阶段只入队不改尺寸，攒到 `load` 之后一次性处理（重排 100 次 → 1 次）。
+缩略图还会被设置 `decoding="async"`：DMM 封面动辄 800×1200，我们又把它们放大了，
+同步解码会卡在渲染那一步。
+
+### 关于卡顿
+
+交付版**不含性能探针和 `[MT-PERF]` 诊断日志**，只有两种真正出错时才会各输出一条提示：
+误装了未构建的模板（避免整脚本失效却没提示）、订阅页读不到卡片（便于确认站点结构是否改版）。
+排查过程与结论见文末「已确认的现场结论」。
+
+排障开关仍作为隐藏功能保留（默认全开、不会打印）：
+`localStorage.mt_off = 'title' | 'thumb' | 'badge' | 'all'`，
+用 `localStorage.removeItem('mt_off')` 恢复。
+
+---
+
+## 订阅（「已订阅」标签）
+
+M-Team 的「女优展示」（`/showcase?action=fav`，即 **我的女优 / 收藏**）里订阅了哪些女优，
+脚本读到来会在种子标题命中时，于**这一条的最后面**追加一个绿色标签 **「已订阅」**。
+
+> **1.5.0 起：脚本不再自动监测订阅，也不发任何网络请求。**
+> 旧版会自发调 `/api/dmm/showcase/search`（带签名），常被 WAF / CORS 拦成 403，
+> 反复重试既刷控制台报错又拖慢页面。现在订阅名单**只有一个来源**：
+> 你打开订阅页、点一下面板上的「已订阅」按钮，脚本从页面卡片 DOM 读一次。
+
+### 使用方法（两步）
+
+1. 打开女优订阅页：`/showcase?action=fav`（切到「收藏」tab，等卡片加载出来）。
+2. 点右下角面板的 **「已订阅 0」** 按钮 —— 脚本从卡片读取名单并缓存，
+   按钮变成 **「已订阅 N」**，之后回到种子列表页就会显示「已订阅」标签。
+
+如果没到订阅页就点按钮（名单为 0），会弹出一条 6 秒自动消失的提示，
+带 **「打开收藏页同步」** 链接，点它直接跳到订阅页。其它页面点按钮只读本地缓存，不发请求。
+
+**DOM 读取细节**：名字链接取文本，图片链接取 `img[alt]`；卡片路径换过几版，
+多套选择器都试（`a[href*="/showcaseDetail"]`、`/showcase/`、`/actress`、`/star`），
+都不命中再用 `alt` 兜底。**只认「收藏」tab**（看激活 tab 的 `data-node-key` / `data-key`），
+停在「首页 / 我的」不会把整页女优当订阅。卡片实测被渲染在激活 pane 之外，
+所以先在 pane 里找、找不到退回整页；卡片也不是 `<a>` 链接，靠图片 `alt` 读出名字。
+点按钮是覆盖式刷新，能一次清掉旧的错误名单。读不到卡片时控制台会打印一份页面结构诊断
+（URL、激活 tab、图片/链接数量、前 12 个链接与 alt），贴给开发者即可修选择器。
+
+### 控制台里的报错说明（都不是脚本发的）
+
+脚本已经不存在任何自发请求，所以下面这些报错与它无关：
+
+- `api2.m-team.cc/ping` 的 CORS / `ERR_FAILED`：**站点前端**探测 API 主机的 `/ping` 请求
+  （`main.*.js` 的 `checkApiHosts`），备机返回跨站重定向就会报，属于页面噪音。
+- `api2.m-team.cc/api/dmm/showcase/search` 的 CORS：**站点自己**拉收藏列表时被拦；
+  这时页面上的收藏列表本身就是空的，脚本无能为力。可在 m-team 页面控制台执行一次
+  `localStorage.setItem('apiHost', 'https://api.m-team.cc/api'); location.reload();`
+  让站点切回主站。
+- `bootstrap-autofill-overlay.js` 的 `querySelectorAll ... not a valid selector`：
+  浏览器的自动填充功能自身的问题，与油猴脚本无关。
+- `manifest.json: property 'start_url' ignored`：Tampermonkey 给 userscript 注入 manifest 的提示，可忽略。
+
+其余行为：
+
+- **独立匹配**：订阅名单单独建一台 Aho-Corasick，**不依赖身高数据**——
+  即使某个女优还没有身高记录，订阅了照样会显示「已订阅」。
+- **位置**：追加在条目标题文本的最后（同一行有多个女优时也只加一个「已订阅」）。
+- **缓存**：名单缓存在 `mt_subscribed_actresses`（无有效期，直到你下次点按钮覆盖），
+  面板上的 `已订阅 N` 显示当前数量；启动时只读缓存秒开，不联网。
+- **关闭**：把面板「女优身高」取消勾选只影响身高标签，「已订阅」标签与订阅数始终保留。
+
+---
+
+## 收藏
+
+面板上的 `☆` 收藏当前页面，旁边的「收藏列表 (n)」查看 / 删除。收藏存在 `mt_fav_list`，
+GM 环境走 `GM_setValue`（跨 m-team 各子域共享），网页环境退回 `localStorage`。
+
+**多标签页同步**：存储是唯一真相源，每个页面的每次操作 / 渲染前都会重新读一次，
+写入前先把对端的最新数据合并进来再落盘，因此两个页面交替收藏不会互相覆盖。
+本页删除的条目会记进墓碑（tombstone），不会被对端旧数据复活。
+同步通道：GM 环境用 `GM_addValueChange`，网页环境用 `storage` 事件，
+切回页面（`visibilitychange` / `focus`）时再补一次兜底。
+
+---
+
+## 数据更新
 
 DMM 演员库会持续新增，建议每隔几个月更新一次：
 
@@ -156,10 +263,17 @@ node tools/build-userscript.mjs
 | `--hits N` | 每页条数，上限 100 |
 | `--delay N` | 每次请求间隔毫秒，默认 300（调小更快，调大更稳） |
 | `--pages N` | 只抓前 N 页（调试用） |
+| `--from N` | 从指定 offset 开始抓（DMM 对单次抓取有上限/限流时用它补抓后半段） |
 | `--merge-only` | 不发请求，只用缓存重新生成数据集 |
 | `--no-resume` | 忽略缓存，从头抓取 |
 
-### 测试
+> **不会丢人**：归并时会保留旧数据集里本次没有抓到的条目（DMM 返回 `BAD REQUEST` /
+> 抓取被截断时不至于把已有女优删掉），DMM 的新结果优先覆盖同名条目。
+> 若中途被限流，等一段时间后可用 `--from <上次中断的 offset>` 补抓剩余部分。
+
+---
+
+## 测试
 
 ```powershell
 # 匹配逻辑单元测试（含全量数据集冒烟测试，需先 build）
@@ -168,6 +282,12 @@ node tools/test-matching.mjs
 # 迷你 DOM 集成测试：用最小 DOM 实现真实执行 dist 里的脚本，
 # 验证「名字后面插入身高标签」的完整链路（含多名字、SPA 复用节点等场景）
 node tools/test-dom.mjs
+
+# 「列表大图」独立测试：验证原始 m-team-big.js 的截断放开逻辑
+node tools/test-mteam-big.mjs
+
+# 多标签页收藏同步：真实执行产物两次（两个沙箱 = 两个页面，共享一份存储）
+node tools/test-fav-sync.mjs
 ```
 
 `test-matching.mjs` 覆盖：空格 / 标点 / 全角空格分隔、名字后紧跟假名、最长匹配去重叠、
@@ -177,8 +297,43 @@ node tools/test-dom.mjs
 `test-dom.mjs` 覆盖：标题锚点（新版 `/detail/` + 旧版 `details.php`）、名字后正确插入标签、
 不打断原文字、非目标元素不标注、无命中不插入、单条标题多名字逐个插入；
 以及合并进来的「列表大图」能力（缩略图等比缩放、`.mt-full-title` 放开截断、右下角统一面板）。
+订阅部分覆盖：启动只读缓存恢复名单且**零网络请求**、命中订阅女优后在标题末尾追加「已订阅」、
+一条多女优只加一个、无命中不加、面板订阅数；名单为 0 时点按钮弹「去订阅页」提示且仍不发请求。
+订阅页专项：**启动不自动读 DOM、点一次按钮才读**、读到后写入缓存（图片 alt 与名字链接去重）、
+不在收藏页时点按钮也不误读、Tab 区分（首页 all 激活不抓、收藏 fav 激活即使 URL 无 action 也能读）、
+卡片渲染在激活 pane 之外时退回整页、卡片不是链接时靠图片 alt 兜底、
+卡片路径改版后仍能读、路径完全不认识时 alt 兜底、卡片未渲染时点按钮给提示不写缓存。
+性能回归（这几条是防卡死的主防线）：滚动期间不立即改缩略图尺寸、滚动停止后补做缩放、
+`applyFullTitles` 检测阶段不得已有元素被加类（读写成对交错会全页重算）、
+`processElement` 签名早退前不得逐字符建对象，另加两条结构断言守住三段式与滚动门控，
+以及 `overflow-wrap` 不得用 `anywhere`、
+`.mt-full-title` 不得落在 `tr`/`td` 上、三个排障开关真的能关掉对应功能、
+首屏加载中不插标签且 `load` 后立即补上。
+当前 48 项全通过。
 
-### 关于 API 凭据
+### 已确认的现场结论（2026-11-19）
+
+在 `/browse?stand=6&stand=7` 页面实测：脚本所有阶段合计约 130ms，
+`L0` 基线 0.1ms、`L1/L2/L3` 合计不到 50ms；但浏览器 Long Task 报 1.2 秒。
+LoAF 的脚本归属显示那 1.2 秒全是站点的 `vendors-*.js` 在执行 JS
+（`长帧 1276ms · 脚本=[vendors-…js:1275ms]`）。
+**即：卡顿不是本脚本的 JS、布局或绘制造成的。**
+用 `localStorage.mt_off = 'all'` 关掉本脚本三个功能后刷新，长帧依旧 → 站点自身问题；
+长帧消失 → 是站点 JS 被我们的 DOM 改动触发。
+
+排查这类问题优先看 LoAF（`long-animation-frame`）而不是 `longtask`：
+后者只说「主线程堵了」，前者能给出 `e.scripts[].sourceURL / duration`，指明是谁的 JS。
+
+`test-mteam-big.mjs` 覆盖：原始「列表大图」脚本注入的放开截断样式、被截断标题标记、
+正常标题不受影响、外层裁切容器标记、列表行外链接不受影响。
+
+`test-fav-sync.mjs` 覆盖：A/B 两页交替收藏不互相覆盖、跨页数量与列表即时同步、
+星星跟随当前页收藏状态、跨页删除同步、删除不被复活、错过事件后切回页面补齐、
+两页近乎同时收藏也不丢条目。（把修复回退后此测试会有 5 项失败，可作有效性验证。）
+
+---
+
+## 关于 API 凭据
 
 抓取脚本默认沿用 joyu.sexy 的公开 `api_id` / `affiliate_id`。这只是数据来源标识，
 不涉及账号密码。若你希望请求归属到自己的账号，可到
@@ -191,4 +346,4 @@ node tools/test-dom.mjs
 
 ## 许可
 
-本项目采用 MIT 许可，详见 [LICENSE](LICENSE)。
+MIT

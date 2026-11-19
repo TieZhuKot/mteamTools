@@ -5,8 +5,14 @@ build/avjoyudb-cache.json
 build/warashi-height.jsonl
 build/warashi-links.json
 
-# AI 助手本地记忆
+# AI 助手本地记忆 / 工具缓存
 .codebuddy/
+.workbuddy/
+.opencode/
+
+# 浏览器抓页存档（用于排查，体积大且含站点静态资源）
+cankan/
+tools/_tmp_tab.mjs
 
 # 编辑器 / 系统文件
 .vscode/

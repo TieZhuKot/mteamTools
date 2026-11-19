@@ -48,11 +48,12 @@ const CONFIG = {
 
 // ---------------- 参数解析 ----------------
 function parseArgs(argv) {
-    const opts = { hits: CONFIG.HITS, delay: CONFIG.DELAY_MS, mergeOnly: false, resume: true, pages: Infinity };
+    const opts = { hits: CONFIG.HITS, delay: CONFIG.DELAY_MS, mergeOnly: false, resume: true, pages: Infinity, from: 0 };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--hits') opts.hits = Math.min(100, parseInt(argv[++i], 10) || 100);
         else if (a === '--pages') opts.pages = parseInt(argv[++i], 10) || Infinity;
+        else if (a === '--from') opts.from = Math.max(1, parseInt(argv[++i], 10) || 1);
         else if (a === '--delay') opts.delay = parseInt(argv[++i], 10) || 0;
         else if (a === '--merge-only') opts.mergeOnly = true;
         else if (a === '--no-resume') opts.resume = false;
@@ -134,10 +135,12 @@ async function main() {
 
     if (!opts.mergeOnly) {
         console.log(`开始抓取：每页 ${opts.hits} 条，间隔 ${opts.delay}ms ...`);
-        // 断点续传：已缓存 records 数即为已完整抓取的条数，从其后的整页边界继续
-        let offset = opts.resume && rows.length > 0
-            ? Math.floor(rows.length / opts.hits) * opts.hits + 1
-            : 1;
+        // 断点续传：--from 优先；否则按已缓存条数估算（缓存是多次抓取拼接时可能不准，此时请显式 --from）
+        let offset = opts.from > 0
+            ? opts.from
+            : opts.resume && rows.length > 0
+                ? Math.floor(rows.length / opts.hits) * opts.hits + 1
+                : 1;
         if (offset > 1) console.log(`断点续传：从 offset=${offset} 继续`);
         let total = Infinity;
         let page = 0;
@@ -208,8 +211,28 @@ async function main() {
     }
 
     const names = Object.keys(dataset).sort((a, b) => a.localeCompare(b, 'ja'));
+    const dmmNameCount = names.length;
+
+    // 保留旧数据集里本次 DMM 结果没有的条目（数据源偶发截断 / 记录被下架时不至于丢人）。
+    // DMM 结果优先：同名条目一律用本次抓到的身高覆盖。
+    let keptOld = 0;
+    if (fs.existsSync(CONFIG.OUT)) {
+        try {
+            const prev = JSON.parse(fs.readFileSync(CONFIG.OUT, 'utf8'));
+            for (const [n, h] of Object.entries(prev || {})) {
+                if (!(n in dataset) && Number.isFinite(Number(h))) {
+                    dataset[n] = Number(h);
+                    keptOld++;
+                }
+            }
+        } catch {
+            /* 旧数据集损坏时忽略 */
+        }
+    }
+
+    const finalNames = Object.keys(dataset).sort((a, b) => a.localeCompare(b, 'ja'));
     const sorted = {};
-    for (const n of names) sorted[n] = dataset[n];
+    for (const n of finalNames) sorted[n] = dataset[n];
 
     fs.mkdirSync(path.dirname(CONFIG.OUT), { recursive: true });
     fs.writeFileSync(CONFIG.OUT, JSON.stringify(sorted), 'utf8');
@@ -218,7 +241,9 @@ async function main() {
     console.log('---------------------------------------------');
     console.log(`原始条目：${rows.length}`);
     console.log(`含身高条目：${withHeight}`);
-    console.log(`唯一女优名（去重）：${names.length}`);
+    console.log(`本次 DMM 唯一女优名：${dmmNameCount}`);
+    if (keptOld) console.log(`沿用旧数据集（本次未抓到）：${keptOld}`);
+    console.log(`唯一女优名（去重）：${finalNames.length}`);
     console.log(`输出：${CONFIG.OUT}  (${sizeKB} KB)`);
 }
 
