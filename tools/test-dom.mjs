@@ -565,6 +565,25 @@ function buildDocument(opts = {}) {
         body.appendChild(viewTbody);
     }
 
+    // ---- 番号排重夹具：标题链接 + br + div 副标题 ----
+    const dedupRows = [];
+    const dedupTbody = new Element('tbody');
+    if (opts.dedupRows) {
+        opts.dedupRows.forEach((st, i) => {
+            const row = new Element('tr');
+            const td = new Element('td');
+            td.appendChild(mk('a', { href: '/detail/D' + i }, st.title || ''));
+            if (st.subtitle) {
+                td.appendChild(mk('br', {}, ''));
+                td.appendChild(mk('div', {}, st.subtitle));
+            }
+            row.appendChild(td);
+            dedupTbody.appendChild(row);
+            dedupRows.push(row);
+        });
+        body.appendChild(dedupTbody);
+    }
+
     // ---- 订阅页夹具：/showcase?action=fav 的女优卡片 ----
     // 结构照抄前端 showcase chunk：图片链接（无文本）+ 名字链接（有文本）
     const showcase = new Element('div');
@@ -617,7 +636,7 @@ function buildDocument(opts = {}) {
     }
 
     DOC = doc;
-    return { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, showcase, clipped, favRows, viewRows, viewTbody, aiLink, anLink };
+    return { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, showcase, clipped, favRows, viewRows, viewTbody, dedupRows, dedupTbody, aiLink, anLink };
 }
 
 /* ============================ 执行脚本 ============================ */
@@ -626,7 +645,7 @@ function run(opts = {}) {
         console.error(`缺少构建产物：${DIST}\n请先运行 node tools/build-userscript.mjs`);
         process.exit(1);
     }
-    const { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, favRows, viewRows, viewTbody, aiLink, anLink } = buildDocument(opts);
+    const { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, favRows, viewRows, viewTbody, dedupRows, dedupTbody, aiLink, anLink } = buildDocument(opts);
     // 模拟「首屏还在加载」：脚本应当推迟动手，避免打断站点首次渲染
     if (opts.readyState) doc.readyState = opts.readyState;
 
@@ -719,7 +738,7 @@ function run(opts = {}) {
     vm.runInContext(code, sandbox, { filename: 'm-team-actress-height.user.js' });
 
     return {
-        a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, favRows, viewRows, viewTbody, aiLink, anLink, doc, store,
+        a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, favRows, viewRows, viewTbody, dedupRows, dedupTbody, aiLink, anLink, doc, store,
         siteXhr: opts.siteXhr,
         pageWindow,
         drainTimers,
@@ -1352,6 +1371,107 @@ const clickSub = (sub) => sub.doc.querySelector('#mt-height-panel .mt-sub-btn').
         assert.ok(r.viewRows[1].classList.contains('mt-hide-row'));
         assert.strictEqual(r.doc.querySelector('#mt-height-panel .mt-height-sort-btn').textContent, '恢复原序');
         assert.strictEqual(r.doc.querySelector('#mt-height-panel .mt-hide-sub-btn').textContent, '显示全部');
+    });
+}
+
+/* ---------------- 番号排重：同番号只留最优版本 ---------------- */
+{
+    // 同一番号 SSIS-001 五条：中字 / 破解 / LTX / 4k / 4k+LTX
+    // 另有 JUR-478 两条（平局留最前）、一条无番号
+    const r = run({
+        dedupRows: [
+            { title: 'SSIS-001 三上悠亜 中文字幕' },
+            { title: 'SSIS-001 三上悠亜 破解版' },
+            { title: 'SSIS-001 三上悠亜 LTX' },
+            { title: 'SSIS-001 三上悠亜 4K' },
+            { title: 'SSIS-001 三上悠亜 4K LTX', subtitle: '4k+ltx' },
+            { title: 'JUR-478 葵つかさ 4K' },
+            { title: 'JUR-478 葵つかさ 中字' },
+            // 4k 与 LTX 直接对比：验证 4k 档位高于 LTX
+            { title: 'MIDE-999 4K' },
+            { title: 'MIDE-999 LTX' },
+            { title: '无番号的一条 4K' },
+        ],
+        quiet: true,
+    });
+    const btn = r.doc.querySelector('#mt-height-panel .mt-dedup-btn');
+    const hidden = () => r.dedupRows.map((row, i) => row.classList.contains('mt-dup-row') ? i : -1).filter((i) => i >= 0);
+
+    t('番号排重：按钮存在，默认关闭', () => {
+        assert.ok(btn, '面板缺少番号排重按钮');
+        assert.strictEqual(btn.textContent, '番号排重');
+        assert.deepStrictEqual(hidden(), []);
+    });
+
+    t('番号排重：同番号按 4k+LTX > 4k > LTX > 破解 > 中字 保留最优', () => {
+        btn.dispatch('click');
+        // 0 中字 / 1 破解 / 2 LTX / 3 4k 被隐藏；4（4k+LTX）保留
+        assert.deepStrictEqual(hidden(), [0, 1, 2, 3, 6, 8],
+            '应只保留 4(4k+LTX) / 5(JUR 4k) / 7(MIDE 4k) / 9(无番号)');
+        assert.strictEqual(btn.textContent, '恢复重复');
+    });
+
+    t('番号排重：平局留最前，JUR-478 中字那条被隐藏', () => {
+        assert.ok(r.dedupRows[6].classList.contains('mt-dup-row'), '第 6 行 JUR 中字应被隐藏');
+        assert.ok(!r.dedupRows[5].classList.contains('mt-dup-row'), '第 5 行 JUR 4K 应保留');
+    });
+
+    t('番号排重：无番号的行不参与，保留显示', () => {
+        assert.ok(!r.dedupRows[9].classList.contains('mt-dup-row'));
+    });
+
+    t('番号排重：4K 档位高于 LTX（MIDE-999 保留 4K 那条）', () => {
+        assert.ok(!r.dedupRows[7].classList.contains('mt-dup-row'), '4K 应保留');
+        assert.ok(r.dedupRows[8].classList.contains('mt-dup-row'), 'LTX 应隐藏');
+    });
+
+    t('番号排重：只加隐藏类不删节点，关掉后恢复全部', () => {
+        assert.strictEqual(r.dedupTbody.childNodes.length, 10, '排重不能删 DOM 节点');
+        btn.dispatch('click');
+        assert.deepStrictEqual(hidden(), []);
+        assert.strictEqual(btn.textContent, '番号排重');
+    });
+
+    t('番号排重：状态写入 localStorage，刷新后自动重放', () => {
+        btn.dispatch('click');
+        assert.strictEqual(r.store.get('mt_dedup'), '1');
+        btn.dispatch('click');
+        assert.strictEqual(r.store.get('mt_dedup'), '0');
+    });
+}
+
+{
+    // 番号只在副标题里、标题没番号：副标兜底
+    const r = run({
+        dedupRows: [
+            { title: '三上悠亜 作品合集', subtitle: 'ABP-123 4K' },
+            { title: '三上悠亜 另一版本', subtitle: 'ABP-123 中字' },
+        ],
+        storage: { mt_dedup: '1' },
+        quiet: true,
+    });
+
+    t('番号排重：标题无番号时从副标取，刷新后自动生效', () => {
+        assert.ok(r.dedupRows[1].classList.contains('mt-dup-row'), '副标 ABP-123 的第二条应被隐藏');
+        assert.ok(!r.dedupRows[0].classList.contains('mt-dup-row'));
+        assert.strictEqual(r.doc.querySelector('#mt-height-panel .mt-dedup-btn').textContent, '恢复重复');
+    });
+}
+
+{
+    // 标题与副标各有不同番号：必须以标题为准，不能按副标误合并
+    const r = run({
+        dedupRows: [
+            { title: 'SSIS-001 三上悠亜', subtitle: 'ABP-123' },
+            { title: 'SSIS-001 三上悠亜 另一版本', subtitle: 'JUR-478' },
+        ],
+        storage: { mt_dedup: '1' },
+        quiet: true,
+    });
+
+    t('番号排重：标题与副标番号不同时只认标题', () => {
+        assert.ok(!r.dedupRows[0].classList.contains('mt-dup-row'), '标题同为 SSIS-001，4K 那条应保留');
+        assert.ok(r.dedupRows[1].classList.contains('mt-dup-row'), 'SSIS-001 中字那条应隐藏');
     });
 }
 

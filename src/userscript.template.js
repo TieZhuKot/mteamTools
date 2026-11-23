@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         M-Team 女优身高标注 + 列表大图
 // @namespace    mteam
-// @version      1.8.7
+// @version      1.8.8
 // @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
@@ -53,6 +53,8 @@ const ENABLED_KEY = 'mt_height_enabled';
 // 列表视图：隐藏已订阅 / 按身高排序（面板按钮切换，记住状态）
 const HIDE_SUB_KEY = 'mt_hide_subscribed';
 const HEIGHT_SORT_KEY = 'mt_height_sort';
+// 番号排重：同番号只留一个，按标题/副标里的版本标记打分选最优
+const DEDUP_KEY = 'mt_dedup';
 
 /* ---- 现场排障开关（默认全开，普通用户用不到）----
  * 卡顿时想确定是哪个功能引起的，控制台执行下面任意几条后刷新即可：
@@ -611,6 +613,50 @@ function writeBoolFlag(key, on) {
 
 let hideSubscribed = readBoolFlag(HIDE_SUB_KEY);
 let heightSortOn = readBoolFlag(HEIGHT_SORT_KEY);
+let dedupOn = readBoolFlag(DEDUP_KEY);
+
+/* ---- 番号排重：同番号只留最优版本 ----
+ * 番号：字母+数字+连字符，如 SSIS-001 / JUR-478 / FC2-PPV-123456。
+ * 标题优先，标题取不到再看副标（列表页副标紧跟在标题链接后的 br+div）。
+ * 版本打分：4k+LTX(5) > 4k(4) > LTX(3) > 破解(2) > 中字(1) > 其它(0)。
+ */
+const CODE_RE = /[A-Za-z]{2,10}-[0-9]{2,8}(?:-[A-Za-z0-9]{2,8})?/g;
+
+function rowTitleText(row) {
+    if (!row || !row.querySelector) return '';
+    const a = row.querySelector('a[href*="/detail/"], a[href*="details.php"]');
+    return a && a.textContent ? a.textContent : '';
+}
+
+// 列表页副标：标题链接后紧跟 br + div（与 TARGET_SELECTORS 里的副标结构一致）
+function rowSubText(row) {
+    const a = row && row.querySelector
+        ? row.querySelector('a[href*="/detail/"], a[href*="details.php"]') : null;
+    if (!a) return '';
+    let n = a.nextSibling;
+    if (n && n.nodeType === 1 && n.tagName === 'BR') n = n.nextSibling;
+    if (n && n.nodeType === 1 && n.tagName === 'DIV') return n.textContent || '';
+    return '';
+}
+
+function extractCode(text) {
+    if (!text) return '';
+    CODE_RE.lastIndex = 0;
+    const m = CODE_RE.exec(text);
+    return m ? m[0].toUpperCase() : '';
+}
+
+function versionScore(titleText, subText) {
+    const text = (titleText || '') + ' ' + (subText || '');
+    const has4k = /4\s*k/i.test(text);
+    const hasLtx = /ltx/i.test(text);
+    if (has4k && hasLtx) return 5;
+    if (has4k) return 4;
+    if (hasLtx) return 3;
+    if (/破解/.test(text)) return 2;
+    if (/中字|中文字幕/.test(text)) return 1;
+    return 0;
+}
 
 function injectListViewStyle() {
     if (document.getElementById(LIST_VIEW_STYLE_ID)) return;
@@ -618,6 +664,7 @@ function injectListViewStyle() {
     style.id = LIST_VIEW_STYLE_ID;
     style.textContent = `
         tr.mt-hide-row { display: none !important; }
+        tr.mt-dup-row { display: none !important; }
     `;
     (document.head || document.documentElement).appendChild(style);
 }
@@ -731,6 +778,42 @@ function applyListView() {
         }
         if (changed) sorted.forEach((row) => parent.appendChild(row));
     }
+
+    // ③ 番号排重：同番号只留版本最优的一条，其余加隐藏类（不删节点，可恢复）
+    //    放在排序之后：无论行怎么移动，分组与选优都基于当前 DOM 顺序，平局留最前。
+    const dupRows = document.querySelectorAll('tr.mt-dup-row');
+    for (let i = 0; i < dupRows.length; i++) dupRows[i].classList.remove('mt-dup-row');
+    if (!dedupOn) return;
+
+    for (let i = 0; i < groups.length; i++) {
+        const { rows } = groups[i];
+        const best = Object.create(null); // code -> { row, score }
+        for (let k = 0; k < rows.length; k++) {
+            const row = rows[k];
+            const title = rowTitleText(row);
+            const sub = rowSubText(row);
+            const code = extractCode(title) || extractCode(sub);
+            if (!code) continue;
+            const score = versionScore(title, sub);
+            const cur = best[code];
+            if (!cur) {
+                best[code] = { row, score };
+            } else if (score > cur.score) {
+                // 后来者更优：隐藏旧的那条，自己顶上（平局不动 → 留最前）
+                cur.row.classList.add('mt-dup-row');
+                best[code] = { row, score };
+            } else {
+                row.classList.add('mt-dup-row');
+            }
+        }
+    }
+}
+
+function toggleDedup() {
+    dedupOn = !dedupOn;
+    writeBoolFlag(DEDUP_KEY, dedupOn);
+    refreshListViewUI();
+    applyListView();
 }
 
 function toggleHideSubscribed() {
@@ -763,6 +846,14 @@ function refreshListViewUI() {
         sortBtn.title = heightSortOn
             ? '当前按身高从高到低排列（无身高的在最后），点此恢复原顺序'
             : '按身高从高到低排列种子，一行多个女优取最高值；无身高的放最后';
+    }
+    const dupBtn = document.querySelector('#mt-height-panel .mt-dedup-btn');
+    if (dupBtn) {
+        dupBtn.textContent = dedupOn ? '恢复重复' : '番号排重';
+        dupBtn.classList.toggle('mt-on', dedupOn);
+        dupBtn.title = dedupOn
+            ? '同番号只保留版本最优的一条（4k+LTX > 4k > LTX > 破解 > 中字），点此恢复全部显示'
+            : '同一番号的多条种子只留最优版本，隐藏其余（不删除），按标题/副标的版本标记判定';
     }
 }
 
@@ -1562,7 +1653,8 @@ function injectPanelStyle() {
             color: #f5c518 !important;
         }
         #mt-height-panel .mt-hide-sub-btn,
-        #mt-height-panel .mt-height-sort-btn {
+        #mt-height-panel .mt-height-sort-btn,
+        #mt-height-panel .mt-dedup-btn {
             appearance: none;
             border: 1px solid rgba(255, 255, 255, 0.35) !important;
             background: transparent !important;
@@ -1582,6 +1674,11 @@ function injectPanelStyle() {
             border-color: #f5c518 !important;
             color: #f5c518 !important;
             background: rgba(245, 197, 24, 0.2) !important;
+        }
+        #mt-height-panel .mt-dedup-btn.mt-on {
+            border-color: #69c0ff !important;
+            color: #69c0ff !important;
+            background: rgba(24, 144, 255, 0.2) !important;
         }
         #mt-height-panel .mt-site-fav-btn {
             appearance: none;
@@ -1898,6 +1995,13 @@ function buildPanel() {
     sortBtn.className = 'mt-height-sort-btn';
     sortBtn.addEventListener('click', toggleHeightSort);
     wrap.appendChild(sortBtn);
+
+    // 番号排重：同番号只留最优版本
+    const dedupBtn = document.createElement('button');
+    dedupBtn.type = 'button';
+    dedupBtn.className = 'mt-dedup-btn';
+    dedupBtn.addEventListener('click', toggleDedup);
+    wrap.appendChild(dedupBtn);
 
     const sep2 = document.createElement('span');
     sep2.className = 'mt-panel-sep';
