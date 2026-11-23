@@ -86,13 +86,17 @@ function main() {
 
     // 2) 与上一次成功构建比较：内容变了就必须同时升版本号
     //    （同一版本号覆盖发布，Tampermonkey 不会提示用户更新）
-    const stampOf = (t) => t.replace(/^\/\/\s*@version\s+\S+.*$/m, '');
+    // 统一行尾符再比较：Windows 上 git checkout 会把 LF 变成 CRLF，
+    // core.mjs 内联时还可能残留孤立 CR，这些都不算脚本内容变化
+    const stampOf = (t) => t
+        .replace(/^\/\/\s*@version\s+\S+.*$/m, '')
+        .replace(/\r\n?/g, '\n');
     const snapshot = fs.existsSync(SNAPSHOT_FILE)
         ? JSON.parse(fs.readFileSync(SNAPSHOT_FILE, 'utf8'))
         : null;
 
     if (snapshot && snapshot.version) {
-        const contentChanged = snapshot.stamp !== stampOf(out);
+        const contentChanged = stampOf(snapshot.stamp) !== stampOf(out);
         if (contentChanged && snapshot.version === tplVersion) {
             console.error('---------------------------------------------');
             console.error(`✗ 脚本内容有改动，但 @version 仍是 ${tplVersion}，没有递增。`);

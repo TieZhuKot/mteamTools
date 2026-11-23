@@ -4,8 +4,9 @@
  *
  * Sources (in priority order):
  *   1. build/actress-height.json (existing, highest priority)
- *   2. build/avjoyudb-cache.json (av-joyu-db.com)
- *   3. build/cache/warashi-height.jsonl (warashi-asian-pornstars.fr)
+ *   2. build/javdatabase-cache.json (javdatabase.com, JP names)
+ *   3. build/avjoyudb-cache.json (av-joyu-db.com)
+ *   4. build/cache/warashi-height.jsonl (warashi-asian-pornstars.fr)
  *
  * Name matching:
  *   - Exact match on Japanese name
@@ -18,11 +19,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cleanJavName } from './lib-javdatabase.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 
 const EXISTING_PATH = path.join(ROOT, 'build', 'actress-height.json');
+const JAVDB_PATH = path.join(ROOT, 'build', 'javdatabase-cache.json');
 const AVJOYUDB_PATH = path.join(ROOT, 'build', 'avjoyudb-cache.json');
 const WARASHI_PATH = path.join(ROOT, 'build', 'cache', 'warashi-height.jsonl');
 
@@ -87,6 +90,22 @@ function loadExisting() {
     return data;
 }
 
+
+/** Load javdatabase cache: { "日文名": height } */
+function loadJavDatabase() {
+    if (!fs.existsSync(JAVDB_PATH)) return [];
+    try {
+        const cache = JSON.parse(fs.readFileSync(JAVDB_PATH, 'utf8'));
+        return Object.entries(cache)
+            .filter(([, h]) => Number.isInteger(h) && h >= 130 && h <= 200)
+            .map(([raw, height]) => ({ name: cleanJavName(raw), height, source: 'javdatabase' }))
+            .filter((e) => e.name);
+    } catch (e) {
+        console.warn(`  ! 读取 javdatabase 缓存失败: ${e.message}`);
+        return [];
+    }
+}
+
 /** Load av-joyu-db cache */
 function loadAvJoyuDb() {
     if (!fs.existsSync(AVJOYUDB_PATH)) return [];
@@ -136,6 +155,9 @@ function main() {
         console.log(`Clean dataset: ${Object.keys(existing).length} entries`);
     }
 
+    const javdb = loadJavDatabase();
+    console.log(`javdatabase entries with height: ${javdb.length}`);
+
     const avjoyu = loadAvJoyuDb();
     console.log(`av-joyu-db entries with height: ${avjoyu.length}`);
 
@@ -174,7 +196,12 @@ function main() {
         added++;
     }
 
-    // Add av-joyu-db entries first (higher quality - exact heights)
+    // Add javdatabase entries first (JP names, second priority after existing)
+    for (const e of javdb) {
+        tryAdd(e.name, e.height, e.source);
+    }
+
+    // Then av-joyu-db entries
     for (const e of avjoyu) {
         tryAdd(e.name, e.height, e.source);
     }

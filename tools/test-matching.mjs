@@ -115,6 +115,24 @@ test('拉丁名后紧跟汉字可命中', () => {
     assert.deepStrictEqual(matchedNames(map, 'Ray中出し'), ['Ray']);
 });
 
+// 9d-2) 两字母缩写与中文粘连不算人名（回归：AI破解 里的 AI 不是女优）
+test('两字母拉丁名紧邻中文不命中（AI破解 不是 AI）', () => {
+    const map = { AI: 166 };
+    assert.deepStrictEqual(matchedNames(map, 'AI破解'), [], '「AI破解」的 AI 是标签词，不该标注');
+    assert.deepStrictEqual(matchedNames(map, 'AI修复 中文字幕'), [], '「AI修复」同样不该命中');
+    assert.deepStrictEqual(matchedNames(map, '破解AI'), [], '左侧紧邻中文也不该命中');
+    // 有分隔符或独立成词时仍然认（真女优 AI 的片子）
+    assert.deepStrictEqual(matchedNames(map, 'AI 破解'), ['AI']);
+    assert.deepStrictEqual(matchedNames(map, 'SSIS-001 AI 中出し'), ['AI']);
+    assert.deepStrictEqual(matchedNames(map, '【AI】新作'), ['AI']);
+});
+
+test('三字母拉丁名紧邻中文仍命中（规则只针对两字母缩写）', () => {
+    const map = { AYA: 158, Ray: 164 };
+    assert.deepStrictEqual(matchedNames(map, 'AYA中出し'), ['AYA']);
+    assert.deepStrictEqual(matchedNames(map, 'Ray中出し'), ['Ray']);
+});
+
 // 9e) isLatinName / isLatinWordBoundary 直接判定
 test('isLatinName / isLatinWordBoundary 逻辑', () => {
     assert.strictEqual(isLatinName('Ray'), true);

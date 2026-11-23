@@ -59,6 +59,20 @@ export function isLatinWordBoundary(text, index) {
     return !LATIN_WORD_RE.test(text[index]);
 }
 
+/** index 处是否为中日文字符（越界为 false） */
+export function isCjkAt(text, index) {
+    if (index < 0 || index >= text.length) return false;
+    return CJK_CHAR_RE.test(text[index]);
+}
+
+/**
+ * 两字母以内的纯拉丁名（AI / AN）后面直接接中日文时视为粘连，不认作人名。
+ * 典型误报：「AI破解」「AI修复」里的 AI —— 这是标签词，不是女优「AI」。
+ * 更长的拉丁名（Ray / May / AYA）保留「紧邻汉字仍可命中」的行为，
+ * 因为「Ray中出し」这类确实是名字跟着日文词。
+ */
+export const SHORT_LATIN_MAX_LEN = 2;
+
 /**
  * 构建 Aho-Corasick 自动机
  * @param {string[]} patterns 模式串（女优名）
@@ -157,6 +171,10 @@ export function pickMatches(automaton, text, options = {}) {
             if (isLatinName(name)) {
                 // 拉丁名：两侧都必须是词边界，避免 "Ray" 命中 "BluRay" 这类词内子串
                 if (!isLatinWordBoundary(text, m.start - 1) || !isLatinWordBoundary(text, m.end)) continue;
+                // 两字母缩写与中日文直接相连（AI破解 / AI修复）：属于标签词粘连，不是人名。
+                // 只对极短拉丁名生效，避免误伤「Ray中出し」这类真实名字。
+                if (name.length <= SHORT_LATIN_MAX_LEN &&
+                    (isCjkAt(text, m.start - 1) || isCjkAt(text, m.end))) continue;
             } else {
                 // 中日文名：日文没有词分隔符，只要不是两侧都被名字字符夹住即可放行
                 const leftOk = isBoundary(text, m.start - 1);

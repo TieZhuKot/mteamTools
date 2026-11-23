@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         M-Team 女优身高标注 + 列表大图
 // @namespace    mteam
-// @version      1.8.0
+// @version      1.8.7
 // @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
@@ -49,6 +49,10 @@ const TARGET_SELECTORS = [
 
 // 是否启用身高标注（可在面板中切换）
 const ENABLED_KEY = 'mt_height_enabled';
+
+// 列表视图：隐藏已订阅 / 按身高排序（面板按钮切换，记住状态）
+const HIDE_SUB_KEY = 'mt_hide_subscribed';
+const HEIGHT_SORT_KEY = 'mt_height_sort';
 
 /* ---- 现场排障开关（默认全开，普通用户用不到）----
  * 卡顿时想确定是哪个功能引起的，控制台执行下面任意几条后刷新即可：
@@ -127,11 +131,19 @@ const ACTRESS_HEIGHT = /* @__DATA__ */ {};
 // 数据集中部分名字使用全角英数（如「ＡＩＫＡ」），而 M-Team 标题中可能用半角（AIKA），
 // 反之亦然。对模式和待扫描文本统一做全角→半角归一化后，两侧字符集一致才能命中。
 // 归一化保持字符串长度不变（1:1 字符映射），因此匹配偏移量可直接用于原始 DOM 锚点。
+// 明确不参与匹配的名字。数据集里仍保留（`build/actress-height.json` 不动），随时可恢复。
+// 「AI」「AN」在标题里绝大多数是标签词/缩写（AI破解、AN 修复等），极易误标，
+// 标错的代价（多出 166cm、把该行顶到身高排序前面）比漏标大得多。
+const IGNORED_NAMES = ['AI', 'AN'];
+const _ignoredNorm = Object.create(null);
+IGNORED_NAMES.forEach((n) => { _ignoredNorm[normalizeStr(n)] = 1; });
+
 const NORMALIZED_HEIGHT = Object.create(null);
 const _patterns = [];
 for (const _name in ACTRESS_HEIGHT) {
     const _norm = normalizeStr(_name);
     if (_norm.length < OPTIONS.minNameLength) continue;
+    if (_ignoredNorm[_norm]) continue;
     if (!(_norm in NORMALIZED_HEIGHT)) {
         NORMALIZED_HEIGHT[_norm] = ACTRESS_HEIGHT[_name];
         _patterns.push(_norm);
@@ -468,6 +480,290 @@ function refreshSubscriptions(force) {
 
     renderSubUI();
     if (changed || subCount) scanAll();
+}
+
+/* ============================================================
+ * 一键把「带已订阅标记的种子」收藏到 M-Team 站点自己的收藏夹
+ * 做法：模拟点击站点列表行里的 star 按钮，由站点自己发请求。
+ * 脚本自身依旧不发任何网络请求。
+ * 站点实测：未收藏 = span.anticon-star 的 inline style 为 color: var(--mt-icon-color)
+ *           已收藏 = color: gold
+ * ============================================================ */
+const SITE_FAV_GAP_MS = 350; // 两次点击的间隔：太快容易被站点当成机器人
+let siteFavRunning = false;
+let siteFavTimer = null;
+
+// 站点已收藏：inline style 里有 gold，或计算样式是金色
+function siteStarFaved(icon) {
+    if (!icon) return false;
+    const inline = String(icon.getAttribute && icon.getAttribute('style') || '');
+    if (/\bgold\b|#ffd700|rgb\(\s*255\s*,\s*215\s*,\s*0\s*\)/i.test(inline)) return true;
+    try {
+        const st = getComputedStyle(icon);
+        const c = String((st && st.color) || '');
+        if (/\bgold\b|255\s*,\s*215\s*,\s*0/i.test(c)) return true;
+    } catch (e) { /* ignore */ }
+    return false;
+}
+
+// 找出一行里站点自己的 star 按钮（不是面板里的星星）
+function siteStarButtonOfRow(row) {
+    if (!row || !row.querySelectorAll) return null;
+    const icons = row.querySelectorAll('.anticon-star');
+    for (let i = 0; i < icons.length; i++) {
+        const icon = icons[i];
+        // 站点 star 图标带 aria-label="star"；面板里的 mt-fav-star 是纯文本，不会有它
+        if (icon.getAttribute && icon.getAttribute('aria-label') !== 'star') continue;
+        const btn = icon.closest && icon.closest('button');
+        if (btn) return { btn, icon };
+    }
+    return null;
+}
+
+// 当前列表里待收藏的行：带 .mt-sub-badge 且站点星标还没变金
+// 统计带「已订阅」标记、且行内有站点收藏按钮的种子：
+// total = 可收藏总数，faved = 其中站点已收藏，pending = 还没收藏的按钮
+function siteFavScan() {
+    const pending = [];
+    let total = 0;
+    let faved = 0;
+    const seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+    const badges = document.querySelectorAll('.mt-sub-badge');
+    for (let i = 0; i < badges.length; i++) {
+        const row = badges[i].closest && badges[i].closest('tr');
+        if (!row) continue;
+        if (seen) {
+            if (seen.has(row)) continue;
+            seen.add(row);
+        }
+        const star = siteStarButtonOfRow(row);
+        if (!star) continue; // 行内没有站点收藏按钮，不计入可收藏
+        total++;
+        if (siteStarFaved(star.icon)) faved++;
+        else pending.push(star.btn);
+    }
+    return { total, faved, pending };
+}
+
+function siteFavBtnEl() {
+    try { return document.querySelector('#mt-height-panel .mt-site-fav-btn'); }
+    catch (e) { return null; }
+}
+
+function renderSiteFavUI() {
+    const btn = siteFavBtnEl();
+    if (!btn) return;
+    const s = siteFavScan();
+    const left = s.total - s.faved;
+    btn.textContent = siteFavRunning ? '收藏中…' : `收藏已订阅 (${s.faved}/${s.total})`;
+    btn.classList.toggle('mt-fav-busy', siteFavRunning);
+    btn.title = siteFavRunning
+        ? '正在把带「已订阅」标记的种子加入 M-Team 收藏夹'
+        : `已收藏 ${s.faved} / 可收藏 ${s.total}，还剩 ${left} 条未收藏。`
+        + '点此把未收藏的加入 M-Team 收藏夹；已收藏的会自动跳过。';
+}
+
+// 串行点击，每次点完等站点渲染完星标再处理下一条
+function startSiteFav() {
+    if (siteFavRunning) return;
+    const queue = siteFavScan().pending;
+    if (!queue.length) {
+        showSubToast('当前列表没有待收藏的「已订阅」种子（可能都已收藏）。', false);
+        renderSiteFavUI();
+        return;
+    }
+    siteFavRunning = true;
+    renderSiteFavUI();
+    let idx = 0;
+    const step = () => {
+        if (idx >= queue.length) {
+            siteFavRunning = false;
+            siteFavTimer = null;
+            renderSiteFavUI();
+            showSubToast(`已提交收藏 ${queue.length} 条种子到 M-Team 收藏夹。`, false);
+            return;
+        }
+        const btn = queue[idx++];
+        try {
+            // 站点可能已把这行重渲染，重新确认还没收藏再点
+            const icon = btn.querySelector && btn.querySelector('.anticon-star');
+            if (btn.isConnected !== false && !siteStarFaved(icon)) btn.click();
+        } catch (e) { /* 单行失败不影响其它行 */ }
+        const btnEl = siteFavBtnEl();
+        if (btnEl) btnEl.textContent = `收藏中 ${idx}/${queue.length}`;
+        siteFavTimer = setTimeout(step, SITE_FAV_GAP_MS);
+    };
+    step();
+}
+
+/* ============================================================
+ * 列表视图：隐藏已订阅 / 按身高从高到低排序
+ * 两者都只操作<tr>，不碰数据、不发请求；刷新页面后按记住的状态重放。
+ * ============================================================ */
+const LIST_VIEW_STYLE_ID = 'mt-list-view-style';
+
+function readBoolFlag(key) {
+    try { return localStorage.getItem(key) === '1'; } catch (e) { return false; }
+}
+function writeBoolFlag(key, on) {
+    try { localStorage.setItem(key, on ? '1' : '0'); } catch (e) { /* ignore */ }
+}
+
+let hideSubscribed = readBoolFlag(HIDE_SUB_KEY);
+let heightSortOn = readBoolFlag(HEIGHT_SORT_KEY);
+
+function injectListViewStyle() {
+    if (document.getElementById(LIST_VIEW_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = LIST_VIEW_STYLE_ID;
+    style.textContent = `
+        tr.mt-hide-row { display: none !important; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+}
+
+// 只取<tr>直接子节点（真实浏览器有 children，测试迷你 DOM 没有，统一遍历 childNodes）
+function childRows(parent) {
+    const out = [];
+    if (!parent || !parent.childNodes) return out;
+    for (let i = 0; i < parent.childNodes.length; i++) {
+        const n = parent.childNodes[i];
+        if (n.nodeType === 1 && n.tagName === 'TR') out.push(n);
+    }
+    return out;
+}
+
+// 所有种子行：带 /detail/ 或 details.php 链接的<tr>，按它们所属的父节点分组
+function listRowGroups() {
+    const links = document.querySelectorAll('a[href*="/detail/"], a[href*="details.php"]');
+    const groups = []; // { parent, rows }
+    const seenParent = (typeof WeakSet === 'function') ? new WeakSet() : null;
+    for (let i = 0; i < links.length; i++) {
+        const row = links[i].closest && links[i].closest('tr');
+        if (!row || !row.parentNode) continue;
+        const parent = row.parentNode;
+        if (seenParent) {
+            if (seenParent.has(parent)) continue;
+            seenParent.add(parent);
+        } else if (groups.some((g) => g.parent === parent)) {
+            continue;
+        }
+        groups.push({ parent, rows: childRows(parent) });
+    }
+    return groups;
+}
+
+// 一行里所有身高取最大值；没有任何身高标记返回 -1（排序时沉底）
+function rowMaxHeight(row) {
+    const badges = row.querySelectorAll('.mt-height-badge');
+    let max = -1;
+    for (let i = 0; i < badges.length; i++) {
+        const v = parseInt(badges[i].getAttribute('data-mt-height'), 10);
+        if (!isNaN(v) && v > max) max = v;
+    }
+    return max;
+}
+
+// 记住每行的原始顺序：排序开关关掉时按这个顺序还原。
+// 用 row 自身当 key，SPA 替换出的新行不在表里，会按当前 DOM 顺序追加到末尾。
+const _rowOriginalOrder = (typeof WeakMap === 'function') ? new WeakMap() : null;
+
+function rememberOriginalOrder(parent, rows) {
+    if (!_rowOriginalOrder) return;
+    let arr = _rowOriginalOrder.get(parent);
+    if (!arr) {
+        arr = rows.slice();
+        _rowOriginalOrder.set(parent, arr);
+        return;
+    }
+    // 新出现的行（加载更多）按当前顺序补进去；已经不在 DOM 里的丢掉
+    const present = new Set(rows);
+    for (let i = 0; i < rows.length; i++) if (arr.indexOf(rows[i]) < 0) arr.push(rows[i]);
+    for (let i = arr.length - 1; i >= 0; i--) if (!present.has(arr[i])) arr.splice(i, 1);
+}
+
+function restoreOriginalOrder(parent) {
+    if (!_rowOriginalOrder) return;
+    const arr = _rowOriginalOrder.get(parent);
+    if (!arr) return;
+    arr.forEach((row) => {
+        if (row.parentNode === parent) parent.appendChild(row); // 移到末尾即重排
+    });
+}
+
+function applyListView() {
+    injectListViewStyle();
+    const groups = listRowGroups();
+
+    // ① 隐藏已订阅：给所在行打类，不删节点（订阅标签还要留在 DOM 里参与匹配）
+    const subBadges = document.querySelectorAll('.mt-sub-badge');
+    const subRows = (typeof WeakSet === 'function') ? new WeakSet() : null;
+    document.querySelectorAll('tr.mt-hide-row').forEach((tr) => tr.classList.remove('mt-hide-row'));
+    for (let i = 0; i < subBadges.length; i++) {
+        const row = subBadges[i].closest && subBadges[i].closest('tr');
+        if (!row) continue;
+        if (subRows) subRows.add(row);
+        if (hideSubscribed) row.classList.add('mt-hide-row');
+    }
+
+    // ② 身高排序：只在开着的时候动 DOM，关掉时按记住的原始顺序还原
+    for (let i = 0; i < groups.length; i++) {
+        const { parent, rows } = groups[i];
+        rememberOriginalOrder(parent, rows);
+        if (!heightSortOn) {
+            restoreOriginalOrder(parent);
+            continue;
+        }
+        const sorted = rows.slice().sort((a, b) => {
+            const ha = rowMaxHeight(a);
+            const hb = rowMaxHeight(b);
+            if (ha < 0 && hb < 0) return 0;
+            if (ha < 0) return 1;  // 没有身高的沉底
+            if (hb < 0) return -1;
+            return hb - ha;        // 从高到低
+        });
+        // 顺序没变就不写 DOM，避免自己触发 MutationObserver 造成反复扫描
+        let changed = sorted.length !== rows.length;
+        if (!changed) {
+            for (let k = 0; k < rows.length; k++) {
+                if (rows[k] !== sorted[k]) { changed = true; break; }
+            }
+        }
+        if (changed) sorted.forEach((row) => parent.appendChild(row));
+    }
+}
+
+function toggleHideSubscribed() {
+    hideSubscribed = !hideSubscribed;
+    writeBoolFlag(HIDE_SUB_KEY, hideSubscribed);
+    refreshListViewUI();
+    applyListView();
+}
+
+function toggleHeightSort() {
+    heightSortOn = !heightSortOn;
+    writeBoolFlag(HEIGHT_SORT_KEY, heightSortOn);
+    refreshListViewUI();
+    applyListView();
+}
+
+function refreshListViewUI() {
+    const hideBtn = document.querySelector('#mt-height-panel .mt-hide-sub-btn');
+    if (hideBtn) {
+        hideBtn.textContent = hideSubscribed ? '显示全部' : '隐藏已订阅';
+        hideBtn.classList.toggle('mt-on', hideSubscribed);
+        hideBtn.title = hideSubscribed
+            ? '当前已隐藏带「已订阅」标记的种子，点此恢复显示'
+            : '隐藏列表中所有带「已订阅」标记的种子';
+    }
+    const sortBtn = document.querySelector('#mt-height-panel .mt-height-sort-btn');
+    if (sortBtn) {
+        sortBtn.textContent = heightSortOn ? '恢复原序' : '身高排序';
+        sortBtn.classList.toggle('mt-on', heightSortOn);
+        sortBtn.title = heightSortOn
+            ? '当前按身高从高到低排列（无身高的在最后），点此恢复原顺序'
+            : '按身高从高到低排列种子，一行多个女优取最高值；无身高的放最后';
+    }
 }
 
 // 收藏页读不到卡片时，打印一份页面结构，方便定位选择器是否要更新
@@ -1070,6 +1366,8 @@ function scanAll() {
     // querySelectorAll 返回 NodeList（无 concat），先转真数组再合并
     const targets = Array.prototype.slice.call(selectorAll()).concat(findDynamicTargets());
     targets.forEach(processElement);
+    // 身高标签插完后再做视图变换：排序要读 data-mt-height，隐藏要读 .mt-sub-badge
+    applyListView();
 }
 
 let timer = null;
@@ -1175,6 +1473,21 @@ function injectPanelStyle() {
             box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
             user-select: none;
             font-family: system-ui, -apple-system, sans-serif;
+            cursor: move;
+            touch-action: none;
+        }
+        /* 拖动中：禁止选中文字，光标改成抓取态 */
+        #mt-height-panel.mt-dragging,
+        #mt-height-panel.mt-dragging * {
+            cursor: grabbing !important;
+            user-select: none !important;
+        }
+        /* 面板里的按钮/开关点击时仍是手型，不要被 move 光标误导 */
+        #mt-height-panel button,
+        #mt-height-panel label,
+        #mt-height-panel input,
+        #mt-height-panel .mt-close {
+            cursor: pointer;
         }
         #mt-height-panel label {
             display: flex;
@@ -1247,6 +1560,47 @@ function injectPanelStyle() {
         #mt-height-panel .mt-fav-list-btn:hover {
             border-color: #f5c518 !important;
             color: #f5c518 !important;
+        }
+        #mt-height-panel .mt-hide-sub-btn,
+        #mt-height-panel .mt-height-sort-btn {
+            appearance: none;
+            border: 1px solid rgba(255, 255, 255, 0.35) !important;
+            background: transparent !important;
+            color: #fff !important;
+            padding: 2px 8px;
+            border-radius: 999px;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        #mt-height-panel .mt-hide-sub-btn.mt-on {
+            border-color: #7ee2a8 !important;
+            color: #7ee2a8 !important;
+            background: rgba(24, 160, 88, 0.2) !important;
+        }
+        #mt-height-panel .mt-height-sort-btn.mt-on {
+            border-color: #f5c518 !important;
+            color: #f5c518 !important;
+            background: rgba(245, 197, 24, 0.2) !important;
+        }
+        #mt-height-panel .mt-site-fav-btn {
+            appearance: none;
+            border: 1px solid rgba(245, 197, 24, 0.6) !important;
+            background: transparent !important;
+            color: #f5c518 !important;
+            padding: 2px 8px;
+            border-radius: 999px;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        #mt-height-panel .mt-site-fav-btn:hover {
+            background: rgba(245, 197, 24, 0.2) !important;
+            border-color: #f5c518 !important;
+        }
+        #mt-height-panel .mt-site-fav-btn.mt-fav-busy {
+            opacity: 0.6;
+            cursor: progress;
         }
         #mt-height-panel .mt-sub-btn {
             appearance: none;
@@ -1354,6 +1708,130 @@ function renderSizePanel() {
     });
 }
 
+/* ============================================================
+ * 面板拖动：右下角浮窗会挡住站点自己的翻页按钮，允许拖到任意位置并记住
+ * ============================================================ */
+const PANEL_POS_KEY = 'mt_panel_pos';
+
+function readPanelPos() {
+    try {
+        const raw = localStorage.getItem(PANEL_POS_KEY);
+        if (!raw) return null;
+        const o = JSON.parse(raw);
+        if (o && typeof o.left === 'number' && typeof o.top === 'number' &&
+            isFinite(o.left) && isFinite(o.top)) return o;
+    } catch (e) { /* ignore */ }
+    return null;
+}
+
+function writePanelPos(pos) {
+    try {
+        localStorage.setItem(PANEL_POS_KEY, JSON.stringify({
+            left: Math.round(pos.left),
+            top: Math.round(pos.top),
+        }));
+    } catch (e) { /* ignore */ }
+}
+
+// 限制在视口内，保证整个面板都能被抓到（拿不到视口尺寸时不限制，交给浏览器）
+function clampPanelPos(left, top, w, h) {
+    const vw = (typeof window !== 'undefined' && window && window.innerWidth) || 0;
+    const vh = (typeof window !== 'undefined' && window && window.innerHeight) || 0;
+    if (!vw || !vh) return { left: Math.max(0, left), top: Math.max(0, top) };
+    const maxL = Math.max(0, vw - Math.min(w || 0, vw));
+    const maxT = Math.max(0, vh - Math.min(h || 0, vh));
+    return {
+        left: Math.min(Math.max(0, left), maxL),
+        top: Math.min(Math.max(0, top), maxT),
+    };
+}
+
+function applyPanelPos(panel, pos) {
+    if (!panel || !pos || !panel.style) return;
+    panel.style.setProperty('left', Math.round(pos.left) + 'px', 'important');
+    panel.style.setProperty('top', Math.round(pos.top) + 'px', 'important');
+    // 一旦用 left/top 定位，必须把 right/bottom 让开，否则会互相牵制
+    panel.style.setProperty('right', 'auto', 'important');
+    panel.style.setProperty('bottom', 'auto', 'important');
+}
+
+const PANEL_DRAG_THRESHOLD = 4; // 位移小于它视为点击，不影响按钮
+
+function makePanelDraggable(panel) {
+    let dragging = false;
+    let moved = false;
+    let startX = 0, startY = 0, startL = 0, startT = 0;
+    let lastPos = null;
+
+    const saved = readPanelPos();
+    if (saved) applyPanelPos(panel, saved);
+
+    const rectOf = () => (panel.getBoundingClientRect
+        ? panel.getBoundingClientRect()
+        : { left: 0, top: 0, width: 0, height: 0 });
+
+    const onDown = (ev) => {
+        if (ev && ev.button != null && ev.button > 0) return; // 只响应左键 / 触摸
+        const rect = rectOf();
+        startX = ev && ev.clientX != null ? ev.clientX : 0;
+        startY = ev && ev.clientY != null ? ev.clientY : 0;
+        startL = rect.left || 0;
+        startT = rect.top || 0;
+        dragging = true;
+        moved = false;
+        lastPos = null;
+        panel.classList.add('mt-dragging');
+    };
+
+    const onMove = (ev) => {
+        if (!dragging || !ev) return;
+        const dx = (ev.clientX || 0) - startX;
+        const dy = (ev.clientY || 0) - startY;
+        if (!moved && Math.abs(dx) + Math.abs(dy) < PANEL_DRAG_THRESHOLD) return;
+        moved = true;
+        lastPos = clampPanelPos(
+            startL + dx,
+            startT + dy,
+            panel.offsetWidth || 0,
+            panel.offsetHeight || 0,
+        );
+        applyPanelPos(panel, lastPos);
+    };
+
+    const onUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        panel.classList.remove('mt-dragging');
+        if (moved && lastPos) writePanelPos(lastPos);
+    };
+
+    panel.addEventListener('pointerdown', onDown);
+    // 移动/抬起挂在 document 上：鼠标拖出面板范围也能继续跟随
+    if (typeof document !== 'undefined' && document && document.addEventListener) {
+        document.addEventListener('pointermove', onMove, true);
+        document.addEventListener('pointerup', onUp, true);
+        document.addEventListener('pointercancel', onUp, true);
+    }
+    // 拖动结束会紧跟着一个 click：吞掉它，避免误触按钮
+    panel.addEventListener('click', (ev) => {
+        if (!moved) return;
+        moved = false;
+        if (ev && ev.stopPropagation) ev.stopPropagation();
+        if (ev && ev.preventDefault) ev.preventDefault();
+    }, true);
+
+    // 窗口尺寸变化后，把面板拉回可视区域
+    if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+        window.addEventListener('resize', () => {
+            const cur = readPanelPos();
+            if (!cur) return;
+            applyPanelPos(panel, clampPanelPos(
+                cur.left, cur.top, panel.offsetWidth || 0, panel.offsetHeight || 0,
+            ));
+        });
+    }
+}
+
 function buildPanel() {
     if (!OPTIONS.enablePanel || document.getElementById('mt-height-panel')) return;
     injectPanelStyle();
@@ -1399,6 +1877,28 @@ function buildPanel() {
     subBtn.addEventListener('click', () => refreshSubscriptions(true));
     wrap.appendChild(subBtn);
 
+    // 一键把带「已订阅」标记的种子收藏到 M-Team 自己的收藏夹（点站点的 star 按钮）
+    const siteFavBtn = document.createElement('button');
+    siteFavBtn.type = 'button';
+    siteFavBtn.className = 'mt-site-fav-btn';
+    siteFavBtn.textContent = '收藏已订阅 (0/0)';
+    siteFavBtn.title = '已收藏 / 可收藏（带「已订阅」标记的种子）；点此把未收藏的加入 M-Team 收藏夹';
+    siteFavBtn.addEventListener('click', startSiteFav);
+    wrap.appendChild(siteFavBtn);
+
+    // 列表视图：隐藏已订阅 / 按身高排序
+    const hideSubBtn = document.createElement('button');
+    hideSubBtn.type = 'button';
+    hideSubBtn.className = 'mt-hide-sub-btn';
+    hideSubBtn.addEventListener('click', toggleHideSubscribed);
+    wrap.appendChild(hideSubBtn);
+
+    const sortBtn = document.createElement('button');
+    sortBtn.type = 'button';
+    sortBtn.className = 'mt-height-sort-btn';
+    sortBtn.addEventListener('click', toggleHeightSort);
+    wrap.appendChild(sortBtn);
+
     const sep2 = document.createElement('span');
     sep2.className = 'mt-panel-sep';
     wrap.appendChild(sep2);
@@ -1432,6 +1932,7 @@ function buildPanel() {
     wrap.appendChild(close);
 
     (document.body || document.documentElement).appendChild(wrap);
+    makePanelDraggable(wrap);
     renderSizePanel();
     renderFavUI();
 }
@@ -1779,6 +2280,7 @@ function syncSubUI() {
     if (btn.textContent !== want) btn.textContent = want;
     const on = subCount > 0;
     if (btn.classList.contains('mt-sub-on') !== on) btn.classList.toggle('mt-sub-on', on);
+    if (!siteFavRunning) renderSiteFavUI();
 }
 
 /* ============================================================
@@ -1842,6 +2344,8 @@ function boot() {
     _bootAt = Date.now();
     startObserver();
     buildPanel();
+    renderSiteFavUI();
+    refreshListViewUI();
     watchFavStorage(); // 监听其它标签页的收藏改动
     // 订阅名单：只读本地缓存秒开，绝不自动联网、不监测页面接口。
     // 需要更新时，请打开订阅页（/showcase?action=fav）点一次「已订阅」按钮。

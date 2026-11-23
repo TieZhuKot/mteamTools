@@ -223,6 +223,14 @@ class Element extends Node {
         this.attributes[k] = String(v);
         if (k === 'class') String(v).split(/\s+/).filter(Boolean).forEach((c) => this.classList.add(c));
         if (k === 'id') this.id = String(v);
+        if (k === 'style') {
+            // 站点收藏状态就写在 inline style 里（color: gold），测试里要能读到
+            String(v).split(';').forEach((pair) => {
+                const i = pair.indexOf(':');
+                if (i < 0) return;
+                this.style.setProperty(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+            });
+        }
         if (k.indexOf('data-') === 0) {
             const camel = k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
             this.dataset[camel] = String(v);
@@ -245,6 +253,14 @@ class Element extends Node {
     }
     dispatch(type, ev) {
         (this._listeners[type] || []).forEach((fn) => fn(ev || {}));
+    }
+    click() {
+        this.dispatch('click', { target: this });
+    }
+    get isConnected() {
+        let n = this;
+        while (n.parentNode) n = n.parentNode;
+        return n === DOC;
     }
     descendants() {
         const out = [];
@@ -333,7 +349,13 @@ function buildDocument(opts = {}) {
         nodeType: 9,
         childNodes: [],
         readyState: 'complete',
-        addEventListener() {},
+        _listeners: Object.create(null),
+        addEventListener(type, fn) {
+            (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+        },
+        dispatch(type, ev) {
+            (this._listeners[type] || []).forEach((fn) => fn(ev || {}));
+        },
         createElement(tag) {
             const el = new Element(tag);
             return el;
@@ -464,6 +486,85 @@ function buildDocument(opts = {}) {
         }
     }
 
+    // ---- 站点收藏按钮夹具：列表行里站点的 star 按钮，验证「一键收藏已订阅」 ----
+    // favStates 每项：{ sub: 是否带已订阅标记, gold: 是否已收藏 }
+    const favRows = [];
+    if (opts.favStates) {
+        opts.favStates.forEach((st, i) => {
+            const row = new Element('tr');
+            // 站点 star 按钮：anticon-star + aria-label，inline style 表示收藏状态
+            const btn = new Element('button');
+            btn.setAttribute('type', 'button');
+            const icon = new Element('span');
+            icon.setAttribute('role', 'img');
+            icon.setAttribute('aria-label', 'star');
+            icon.setAttribute('class', 'anticon anticon-star');
+            icon.setAttribute('style', st.gold ? 'color: gold;' : 'color: var(--mt-icon-color);');
+            btn.appendChild(icon);
+            let clicks = 0;
+            btn.addEventListener('click', () => {
+                clicks++;
+                btn._clicks = clicks;
+                // 模拟站点：点完变金色
+                icon.setAttribute('style', 'color: gold;');
+            });
+            btn._clicks = 0;
+            row.appendChild(btn);
+            const cell = new Element('td');
+            if (st.sub) {
+                const badge = new Element('span');
+                badge.setAttribute('class', 'mt-sub-badge');
+                badge.textContent = '已订阅';
+                cell.appendChild(badge);
+            }
+            const link = mk('a', { href: '/detail/9000' + i }, 'SSIS-9' + i + ' 三上悠亜 测试标题');
+            cell.appendChild(link);
+            row.appendChild(cell);
+            body.appendChild(row);
+            favRows.push({ row, btn, icon });
+        });
+    }
+
+    // ---- AI 排除验证：数据集里有女优 AI，但标题里「AI 破解」是标签词 ----
+    const aiTr = new Element('tr');
+    const aiTd = new Element('td');
+    const aiLink = mk('a', { href: '/detail/33333' }, 'AI 破解 中文字幕 4k x265');
+    aiTd.appendChild(aiLink);
+    const anLink = mk('a', { href: '/detail/33334' }, 'AN 修复 中文字幕');
+    aiTr.appendChild(anLink);
+    aiTr.appendChild(aiTd);
+    body.appendChild(aiTr);
+
+    // ---- 列表视图夹具：身高排序 / 隐藏已订阅 ----
+    // heights: 每行的身高数组（空=无身高）；sub: 是否带已订阅标记
+    const viewRows = [];
+    const viewTbody = new Element('tbody');
+    if (opts.viewRows) {
+        opts.viewRows.forEach((st, i) => {
+            const row = new Element('tr');
+            const td = new Element('td');
+            const link = mk('a', { href: '/detail/7000' + i }, 'SSIS-7' + i + ' 测试标题 ' + i);
+            td.appendChild(link);
+            (st.heights || []).forEach((h, j) => {
+                const b = new Element('span');
+                b.setAttribute('class', 'mt-height-badge');
+                b.setAttribute('data-mt-height', String(h));
+                b.textContent = ' ' + h + 'cm' + j;
+                td.appendChild(b);
+            });
+            if (st.sub) {
+                const badge = new Element('span');
+                badge.setAttribute('class', 'mt-sub-badge');
+                badge.textContent = '已订阅';
+                td.appendChild(badge);
+            }
+            row.appendChild(td);
+            viewTbody.appendChild(row);
+            viewRows.push(row);
+        });
+        body.appendChild(viewTbody);
+    }
+
     // ---- 订阅页夹具：/showcase?action=fav 的女优卡片 ----
     // 结构照抄前端 showcase chunk：图片链接（无文本）+ 名字链接（有文本）
     const showcase = new Element('div');
@@ -516,7 +617,7 @@ function buildDocument(opts = {}) {
     }
 
     DOC = doc;
-    return { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, showcase, clipped };
+    return { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, showcase, clipped, favRows, viewRows, viewTbody, aiLink, anLink };
 }
 
 /* ============================ 执行脚本 ============================ */
@@ -525,7 +626,7 @@ function run(opts = {}) {
         console.error(`缺少构建产物：${DIST}\n请先运行 node tools/build-userscript.mjs`);
         process.exit(1);
     }
-    const { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped } = buildDocument(opts);
+    const { doc, a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, favRows, viewRows, viewTbody, aiLink, anLink } = buildDocument(opts);
     // 模拟「首屏还在加载」：脚本应当推迟动手，避免打断站点首次渲染
     if (opts.readyState) doc.readyState = opts.readyState;
 
@@ -618,7 +719,7 @@ function run(opts = {}) {
     vm.runInContext(code, sandbox, { filename: 'm-team-actress-height.user.js' });
 
     return {
-        a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, doc, store,
+        a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, clipped, favRows, viewRows, viewTbody, aiLink, anLink, doc, store,
         siteXhr: opts.siteXhr,
         pageWindow,
         drainTimers,
@@ -651,7 +752,7 @@ function badgeTexts(el) {
 }
 
 console.log('--- DOM 集成测试（真实执行构建产物）---');
-const { a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, doc } = run();
+const { a1, a2, a3, a4, a5, div, titleLink, thumb, lazyThumb, aiLink, anLink, doc } = run();
 
 t('标题 1：三上悠亜 后面插入 159cm', () => {
     console.log(`      ${render(a1)}`);
@@ -682,6 +783,16 @@ t('非目标元素（div）不被标注', () => {
 t('无命中的标题不插入标签', () => {
     console.log(`      ${render(a4)}`);
     assert.strictEqual(a4.querySelectorAll('.mt-height-badge').length, 0);
+});
+
+t('匹配：AI 已排除，「AI 破解」不再标注身高（否则会污染排序）', () => {
+    assert.deepStrictEqual(badgeTexts(aiLink), [],
+        '「AI 破解」是标签词，不该被当成女优 AI 标注；实际=' + JSON.stringify(badgeTexts(aiLink))
+        + ' 文本=' + JSON.stringify(aiLink.textContent));
+});
+
+t('匹配：AN 也已排除，不会被当成女优标注', () => {
+    assert.deepStrictEqual(badgeTexts(anLink), []);
 });
 
 t('一条标题内多个名字：逐个插入且互不干扰', () => {
@@ -1059,6 +1170,188 @@ const clickSub = (sub) => sub.doc.querySelector('#mt-height-panel .mt-sub-btn').
         assert.ok(toast, '没有弹出提示');
         assert.ok(/再点一次/.test(toast.textContent), '提示应引导稍后再点：' + toast.textContent);
         assert.ok(!sub.store.get('mt_subscribed_actresses'), '不该写入空缓存');
+    });
+}
+
+/* ---------------- 一键收藏已订阅：只点站点的 star，跳过已收藏 ---------------- */
+{
+    const r = run({
+        favStates: [
+            { sub: true, gold: false },  // 待收藏
+            { sub: true, gold: true },   // 已收藏，必须跳过
+            { sub: false, gold: false }, // 没订阅标记，不能碰
+            { sub: true, gold: false },  // 待收藏
+        ],
+        quiet: true,
+    });
+    const btn = r.doc.querySelector('#mt-height-panel .mt-site-fav-btn');
+
+    t('站点收藏：按钮显示「已收藏/可收藏」，只统计带已订阅标记的行', () => {
+        assert.ok(btn, '面板缺少一键收藏按钮');
+        // 4 行里带已订阅标记的有 3 行，其中 1 行已收藏（gold）
+        assert.strictEqual(btn.textContent, '收藏已订阅 (1/3)',
+            '应显示 已收藏/可收藏，实际：' + btn.textContent);
+        assert.ok(/已收藏 1 \/ 可收藏 3/.test(btn.title), 'title 应说明已收藏与总数：' + btn.title);
+    });
+
+    t('站点收藏：gold 星标被识别为已收藏', () => {
+        assert.strictEqual(r.favRows[1].btn._clicks, 0);
+        assert.ok(r.favRows[1].icon.getAttribute('style').indexOf('gold') >= 0);
+    });
+
+    // 点按钮 → 串行点击 → 排空定时器
+    btn.dispatch('click');
+    r.drainTimers();
+
+    t('站点收藏：只点了待收藏的两条，已收藏与无订阅标记的都不动', () => {
+        assert.strictEqual(r.favRows[0].btn._clicks, 1, '第 1 条应被点击');
+        assert.strictEqual(r.favRows[1].btn._clicks, 0, '已收藏（gold）不该被点击');
+        assert.strictEqual(r.favRows[2].btn._clicks, 0, '无「已订阅」标记不该被点击');
+        assert.strictEqual(r.favRows[3].btn._clicks, 1, '第 4 条应被点击');
+    });
+
+    t('站点收藏：完成后变成「已收藏=可收藏」', () => {
+        assert.strictEqual(btn.textContent, '收藏已订阅 (3/3)', '实际：' + btn.textContent);
+        assert.ok(!btn.classList.contains('mt-fav-busy'));
+    });
+}
+
+{
+    // 没有待收藏项时，按钮点击不能误点任何站点按钮
+    const r = run({
+        favStates: [
+            { sub: true, gold: true },
+            { sub: false, gold: false },
+        ],
+        quiet: true,
+    });
+    const btn = r.doc.querySelector('#mt-height-panel .mt-site-fav-btn');
+
+    t('站点收藏：没有待收藏项时显示 n/n，且不点击任何按钮', () => {
+        assert.strictEqual(btn.textContent, '收藏已订阅 (1/1)');
+        btn.dispatch('click');
+        r.drainTimers();
+        assert.strictEqual(r.favRows[0].btn._clicks, 0);
+        assert.strictEqual(r.favRows[1].btn._clicks, 0);
+    });
+}
+
+/* ---------------- 面板拖动：浮窗不能再挡住翻页按钮 ---------------- */
+{
+    const r = run({ quiet: true });
+    const panel = r.doc.getElementById('mt-height-panel');
+    // 迷你 DOM 没有布局：给面板一个可测量的盒子，拖动才好断言
+    panel.getBoundingClientRect = () => ({ left: 700, top: 500, width: 200, height: 40 });
+    panel.offsetWidth = 200;
+    panel.offsetHeight = 40;
+
+    t('面板拖动：按下 + 移动后位置改变，并写入 localStorage', () => {
+        panel.dispatch('pointerdown', { button: 0, clientX: 720, clientY: 510 });
+        assert.ok(panel.classList.contains('mt-dragging'), '拖动中应有 mt-dragging 类');
+        r.doc.dispatch('pointermove', { clientX: 520, clientY: 310 });
+        r.doc.dispatch('pointerup', {});
+        assert.strictEqual(panel.style.getPropertyValue('left'), '500px', '应向左移动 200px');
+        assert.strictEqual(panel.style.getPropertyValue('top'), '300px', '应向上移动 200px');
+        assert.strictEqual(panel.style.getPropertyValue('right'), 'auto', '必须让开 right');
+        assert.strictEqual(panel.style.getPropertyValue('bottom'), 'auto', '必须让开 bottom');
+        const saved = JSON.parse(r.store.get('mt_panel_pos'));
+        assert.strictEqual(saved.left, 500);
+        assert.strictEqual(saved.top, 300);
+        assert.ok(!panel.classList.contains('mt-dragging'), '松开后应移除拖动类');
+    });
+
+    t('面板拖动：位移小于阈值算点击，不改位置', () => {
+        const before = panel.style.getPropertyValue('left');
+        panel.dispatch('pointerdown', { button: 0, clientX: 720, clientY: 510 });
+        r.doc.dispatch('pointermove', { clientX: 721, clientY: 511 });
+        r.doc.dispatch('pointerup', {});
+        assert.strictEqual(panel.style.getPropertyValue('left'), before, '轻微抖动不该移动面板');
+    });
+
+    t('面板拖动：位置刷新后自动恢复', () => {
+        const again = run({ storage: { mt_panel_pos: '{"left":120,"top":80}' }, quiet: true });
+        const p2 = again.doc.getElementById('mt-height-panel');
+        assert.strictEqual(p2.style.getPropertyValue('left'), '120px');
+        assert.strictEqual(p2.style.getPropertyValue('top'), '80px');
+    });
+}
+
+/* ---------------- 列表视图：隐藏已订阅 / 按身高从高到低排序 ---------------- */
+{
+    // 原始顺序 0..4：身高分别 无 / 159 / [160,166] / 无(已订阅) / 153
+    const r = run({
+        viewRows: [
+            { heights: [] },
+            { heights: [159], sub: true },
+            { heights: [160, 166] },
+            { heights: [], sub: true },
+            { heights: [153] },
+        ],
+        quiet: true,
+    });
+    const hideBtn = r.doc.querySelector('#mt-height-panel .mt-hide-sub-btn');
+    const sortBtn = r.doc.querySelector('#mt-height-panel .mt-height-sort-btn');
+    const order = () => r.viewTbody.childNodes.filter((n) => n.nodeType === 1).map((n) => r.viewRows.indexOf(n));
+
+    t('列表视图：两个按钮存在，默认关闭且文案正确', () => {
+        assert.ok(hideBtn && sortBtn, '面板缺少隐藏/排序按钮');
+        assert.strictEqual(hideBtn.textContent, '隐藏已订阅');
+        assert.strictEqual(sortBtn.textContent, '身高排序');
+        assert.deepStrictEqual(order(), [0, 1, 2, 3, 4]);
+    });
+
+    t('列表视图：按身高从高到低，多身高取最大值，无身高沉底且保持相对顺序', () => {
+        sortBtn.dispatch('click');
+        assert.deepStrictEqual(order(), [2, 1, 4, 0, 3],
+            '应为 166 > 159 > 153 > 无身高(0,3 保持原序)');
+        assert.strictEqual(sortBtn.textContent, '恢复原序');
+    });
+
+    t('列表视图：关掉排序后恢复原始顺序', () => {
+        sortBtn.dispatch('click');
+        assert.deepStrictEqual(order(), [0, 1, 2, 3, 4]);
+        assert.strictEqual(sortBtn.textContent, '身高排序');
+    });
+
+    t('列表视图：隐藏已订阅只加类不删节点，再点恢复', () => {
+        hideBtn.dispatch('click');
+        assert.ok(r.viewRows[1].classList.contains('mt-hide-row'), '已订阅行应被隐藏');
+        assert.ok(r.viewRows[3].classList.contains('mt-hide-row'), '已订阅行应被隐藏');
+        assert.ok(!r.viewRows[0].classList.contains('mt-hide-row'), '未订阅行不该被隐藏');
+        assert.deepStrictEqual(order(), [0, 1, 2, 3, 4], '隐藏不能删节点');
+        assert.strictEqual(hideBtn.textContent, '显示全部');
+        hideBtn.dispatch('click');
+        assert.ok(!r.viewRows[1].classList.contains('mt-hide-row'));
+    });
+
+    t('列表视图：状态写入 localStorage，刷新后自动恢复', () => {
+        assert.strictEqual(r.store.get('mt_height_sort'), '0');
+        assert.strictEqual(r.store.get('mt_hide_subscribed'), '0');
+        sortBtn.dispatch('click');
+        hideBtn.dispatch('click');
+        assert.strictEqual(r.store.get('mt_height_sort'), '1');
+        assert.strictEqual(r.store.get('mt_hide_subscribed'), '1');
+    });
+}
+
+{
+    // 刷新后从缓存恢复状态：排序与隐藏都要自动生效
+    const r = run({
+        viewRows: [
+            { heights: [158] },
+            { heights: [170], sub: true },
+            { heights: [] },
+        ],
+        storage: { mt_height_sort: '1', mt_hide_subscribed: '1' },
+        quiet: true,
+    });
+    const order = () => r.viewTbody.childNodes.filter((n) => n.nodeType === 1).map((n) => r.viewRows.indexOf(n));
+
+    t('列表视图：刷新后自动按身高排序并隐藏已订阅', () => {
+        assert.deepStrictEqual(order(), [1, 0, 2]);
+        assert.ok(r.viewRows[1].classList.contains('mt-hide-row'));
+        assert.strictEqual(r.doc.querySelector('#mt-height-panel .mt-height-sort-btn').textContent, '恢复原序');
+        assert.strictEqual(r.doc.querySelector('#mt-height-panel .mt-hide-sub-btn').textContent, '显示全部');
     });
 }
 
