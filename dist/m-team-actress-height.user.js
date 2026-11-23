@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         M-Team 女优身高标注 + 列表大图
 // @namespace    mteam
-// @version      1.8.8
+// @version      1.8.9
 // @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
@@ -2060,7 +2060,13 @@ function makePanelDraggable(panel) {
     let lastPos = null;
 
     const saved = readPanelPos();
-    if (saved) applyPanelPos(panel, saved);
+    // 存档位置可能是大窗口时拖的，换小窗口后会落到视口外（表现：要按 F12 才看见面板）
+    // 创建时就夹紧一次，不能只等 resize 事件
+    if (saved) {
+        applyPanelPos(panel, clampPanelPos(
+            saved.left, saved.top, panel.offsetWidth || 0, panel.offsetHeight || 0,
+        ));
+    }
 
     const rectOf = () => (panel.getBoundingClientRect
         ? panel.getBoundingClientRect()

@@ -653,6 +653,9 @@ function run(opts = {}) {
     const pageWindow = opts.href
         ? { location: { href: opts.href, hostname: new URL(opts.href).hostname } }
         : {};
+    // 视口尺寸：clampPanelPos 需要它把存档位置夹回可视区域
+    pageWindow.innerWidth = opts.innerWidth || 1000;
+    pageWindow.innerHeight = opts.innerHeight || 800;
     if (opts.siteXhr) pageWindow.XMLHttpRequest = opts.siteXhr;
     if (opts.siteFetch) pageWindow.fetch = opts.siteFetch;
 
@@ -1292,6 +1295,20 @@ const clickSub = (sub) => sub.doc.querySelector('#mt-height-panel .mt-sub-btn').
         const p2 = again.doc.getElementById('mt-height-panel');
         assert.strictEqual(p2.style.getPropertyValue('left'), '120px');
         assert.strictEqual(p2.style.getPropertyValue('top'), '80px');
+    });
+
+    t('面板拖动：存档位置超出视口时，创建时就夹回可视区（不用按 F12）', () => {
+        // 用户换小窗口后存档 left=3000/top=2000 落到屏幕外，必须初始化就夹紧
+        const again = run({
+            storage: { mt_panel_pos: '{"left":3000,"top":2000}' },
+            innerWidth: 1000, innerHeight: 800,
+            quiet: true,
+        });
+        const p2 = again.doc.getElementById('mt-height-panel');
+        // 迷你 DOM 里 offsetWidth/Height 为 0，夹紧上限就是视口尺寸
+        assert.strictEqual(p2.style.getPropertyValue('left'), '1000px',
+            '初始化就该夹紧，不应等 resize 才把面板拉回来');
+        assert.strictEqual(p2.style.getPropertyValue('top'), '800px');
     });
 }
 
