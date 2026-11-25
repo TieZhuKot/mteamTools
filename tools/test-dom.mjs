@@ -487,7 +487,7 @@ function buildDocument(opts = {}) {
     }
 
     // ---- 站点收藏按钮夹具：列表行里站点的 star 按钮，验证「一键收藏已订阅」 ----
-    // favStates 每项：{ sub: 是否带已订阅标记, gold: 是否已收藏 }
+    // favStates 每项：{ sub: 是否带已订阅标记, gold: 是否已收藏, done: 是否已下载完成 }
     const favRows = [];
     if (opts.favStates) {
         opts.favStates.forEach((st, i) => {
@@ -519,6 +519,22 @@ function buildDocument(opts = {}) {
             }
             const link = mk('a', { href: '/detail/9000' + i }, 'SSIS-9' + i + ' 三上悠亜 测试标题');
             cell.appendChild(link);
+            // 已完成下载的种子：Ant Design 进度条 100% + check-circle 对勾
+            if (st.done) {
+                const bar = new Element('div');
+                bar.setAttribute('class', 'ant-progress ant-progress-status-success ant-progress-line');
+                bar.setAttribute('role', 'progressbar');
+                bar.setAttribute('aria-valuenow', '100');
+                const indicator = new Element('span');
+                indicator.setAttribute('class', 'ant-progress-indicator');
+                const check = new Element('span');
+                check.setAttribute('role', 'img');
+                check.setAttribute('aria-label', 'check-circle');
+                check.setAttribute('class', 'anticon anticon-check-circle');
+                indicator.appendChild(check);
+                bar.appendChild(indicator);
+                cell.appendChild(bar);
+            }
             row.appendChild(cell);
             body.appendChild(row);
             favRows.push({ row, btn, icon });
@@ -1235,6 +1251,35 @@ const clickSub = (sub) => sub.doc.querySelector('#mt-height-panel .mt-sub-btn').
     t('站点收藏：完成后变成「已收藏=可收藏」', () => {
         assert.strictEqual(btn.textContent, '收藏已订阅 (3/3)', '实际：' + btn.textContent);
         assert.ok(!btn.classList.contains('mt-fav-busy'));
+    });
+}
+
+{
+    // 已下载完成（100% + 对勾）的种子不该再收藏，避免重复订阅
+    const r = run({
+        favStates: [
+            { sub: true, gold: false, done: true },   // 已完成 → 跳过
+            { sub: true, gold: false, done: false },  // 未完成 → 待收藏
+            { sub: true, gold: false },               // 无进度条 → 待收藏
+            { sub: true, gold: false, done: true },   // 已完成 → 跳过
+        ],
+        quiet: true,
+    });
+    const btn = r.doc.querySelector('#mt-height-panel .mt-site-fav-btn');
+
+    t('站点收藏：已下载完成（100% 对勾）的行不计入可收藏数', () => {
+        assert.strictEqual(btn.textContent, '收藏已订阅 (0/2)',
+            '两条已完成应被排除，实际：' + btn.textContent);
+        assert.ok(/已收藏 0 \/ 可收藏 2/.test(btn.title), 'title 实际：' + btn.title);
+    });
+
+    t('站点收藏：已完成的行一个都不点，只点未完成的两条', () => {
+        btn.dispatch('click');
+        r.drainTimers();
+        assert.strictEqual(r.favRows[0].btn._clicks, 0, '已完成不该被点击');
+        assert.strictEqual(r.favRows[1].btn._clicks, 1, '未完成应被点击');
+        assert.strictEqual(r.favRows[2].btn._clicks, 1, '无进度条应被点击');
+        assert.strictEqual(r.favRows[3].btn._clicks, 0, '已完成不该被点击');
     });
 }
 

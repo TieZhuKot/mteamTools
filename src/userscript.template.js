@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         M-Team 女优身高标注 + 列表大图
 // @namespace    mteam
-// @version      1.8.9
+// @version      1.9.0
 // @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
@@ -522,6 +522,22 @@ function siteStarButtonOfRow(row) {
     return null;
 }
 
+// 种子已下载完成：Ant Design 进度条 100% / status-success / check-circle 对勾。
+// 三者任一命中即可——站点改版时不一定全带，但一般不会同时丢失。
+// 已完成的行不该再被「一键收藏」重复订阅。
+function rowDownloadDone(row) {
+    if (!row || !row.querySelectorAll) return false;
+    const bars = row.querySelectorAll('.ant-progress');
+    for (let i = 0; i < bars.length; i++) {
+        const bar = bars[i];
+        const cls = String(bar.getAttribute && bar.getAttribute('class') || '');
+        if (/ant-progress-status-success/.test(cls)) return true;
+        if (String(bar.getAttribute && bar.getAttribute('aria-valuenow') || '') === '100') return true;
+        if (bar.querySelectorAll && bar.querySelectorAll('.anticon-check-circle').length) return true;
+    }
+    return false;
+}
+
 // 当前列表里待收藏的行：带 .mt-sub-badge 且站点星标还没变金
 // 统计带「已订阅」标记、且行内有站点收藏按钮的种子：
 // total = 可收藏总数，faved = 其中站点已收藏，pending = 还没收藏的按钮
@@ -538,6 +554,7 @@ function siteFavScan() {
             if (seen.has(row)) continue;
             seen.add(row);
         }
+        if (rowDownloadDone(row)) continue; // 已下载完成，不重复订阅
         const star = siteStarButtonOfRow(row);
         if (!star) continue; // 行内没有站点收藏按钮，不计入可收藏
         total++;
@@ -562,7 +579,7 @@ function renderSiteFavUI() {
     btn.title = siteFavRunning
         ? '正在把带「已订阅」标记的种子加入 M-Team 收藏夹'
         : `已收藏 ${s.faved} / 可收藏 ${s.total}，还剩 ${left} 条未收藏。`
-        + '点此把未收藏的加入 M-Team 收藏夹；已收藏的会自动跳过。';
+        + '点此把未收藏的加入 M-Team 收藏夹；已收藏或已下载完成的会自动跳过。';
 }
 
 // 串行点击，每次点完等站点渲染完星标再处理下一条
