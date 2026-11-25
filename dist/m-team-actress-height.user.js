@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
-// @name         M-Team 女优身高标注 + 列表大图
+// @name         M-TeamTools
 // @namespace    mteam
-// @version      1.9.1
+// @version      1.9.2
 // @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
