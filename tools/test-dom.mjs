@@ -403,6 +403,19 @@ function buildDocument(opts = {}) {
         if (text) el.appendChild(new TextNode(text));
         return el;
     };
+    // 已下载完成的进度条：Ant Design 100% + check-circle
+    const mkDoneBar = () => {
+        const bar = mk('div', {
+            class: 'ant-progress ant-progress-status-success ant-progress-line',
+            role: 'progressbar', 'aria-valuenow': '100',
+        });
+        const indicator = mk('span', { class: 'ant-progress-indicator' });
+        indicator.appendChild(mk('span', {
+            role: 'img', 'aria-label': 'check-circle', class: 'anticon anticon-check-circle',
+        }));
+        bar.appendChild(indicator);
+        return bar;
+    };
 
     const a1 = mk('a', { href: '/detail/12345' }, 'SSIS-001 三上悠亜 激しい中出し 1080p');
     const a2 = mk('a', { href: 'details.php?id=6789' }, 'ABP-123 【葵つかさ】初共演スペシャル');
@@ -574,6 +587,7 @@ function buildDocument(opts = {}) {
                 badge.textContent = '已订阅';
                 td.appendChild(badge);
             }
+            if (st.done) td.appendChild(mkDoneBar());
             row.appendChild(td);
             viewTbody.appendChild(row);
             viewRows.push(row);
@@ -593,6 +607,7 @@ function buildDocument(opts = {}) {
                 td.appendChild(mk('br', {}, ''));
                 td.appendChild(mk('div', {}, st.subtitle));
             }
+            if (st.done) td.appendChild(mkDoneBar());
             row.appendChild(td);
             dedupTbody.appendChild(row);
             dedupRows.push(row);
@@ -1534,6 +1549,69 @@ const clickSub = (sub) => sub.doc.querySelector('#mt-height-panel .mt-sub-btn').
     t('番号排重：标题与副标番号不同时只认标题', () => {
         assert.ok(!r.dedupRows[0].classList.contains('mt-dup-row'), '标题同为 SSIS-001，4K 那条应保留');
         assert.ok(r.dedupRows[1].classList.contains('mt-dup-row'), 'SSIS-001 中字那条应隐藏');
+    });
+}
+
+{
+    // 折叠（隐藏已订阅）时，已下载完成的行也要被折叠
+    const r = run({
+        viewRows: [
+            { heights: [] },
+            { heights: [], done: true },              // 已下载，无订阅标记
+            { heights: [], sub: true },               // 已订阅，未下载
+            { heights: [], sub: true, done: true },   // 已订阅且已下载
+        ],
+        quiet: true,
+    });
+    const hideBtn = r.doc.querySelector('#mt-height-panel .mt-hide-sub-btn');
+
+    t('折叠：已下载的行也被隐藏，含无订阅标记的', () => {
+        hideBtn.dispatch('click');
+        assert.ok(r.viewRows[0].classList.contains('mt-hide-row') === false, '普通行不该隐藏');
+        assert.ok(r.viewRows[1].classList.contains('mt-hide-row'), '已下载行应被折叠');
+        assert.ok(r.viewRows[2].classList.contains('mt-hide-row'), '已订阅行应被折叠');
+        assert.ok(r.viewRows[3].classList.contains('mt-hide-row'), '已订阅且已下载应被折叠');
+        assert.strictEqual(r.viewTbody.childNodes.length, 4, '折叠不能删节点');
+    });
+
+    t('折叠：关掉后已下载的行恢复显示', () => {
+        hideBtn.dispatch('click');
+        for (const row of r.viewRows) {
+            assert.ok(!row.classList.contains('mt-hide-row'));
+        }
+    });
+}
+
+{
+    // 排重：已下载优先，但 4k 仍压过已下载的非4k
+    const r = run({
+        dedupRows: [
+            { title: 'SSIS-001 中文字幕', done: true },   // 已下载中字（非4k）
+            { title: 'SSIS-001 破解版' },                 // 未下载破解
+            { title: 'SSIS-001 4K' },                     // 未下载4k → 应胜出
+            { title: 'JUR-478 中字', done: true },        // 已下载中字
+            { title: 'JUR-478 LTX' },                     // 未下载LTX → 已下载胜出
+            { title: 'MIDE-999 4K' },                     // 未下载4k在前
+            { title: 'MIDE-999 4K', done: true },         // 已下载4k在后 → 靠加分胜出
+        ],
+        storage: { mt_dedup: '1' },
+        quiet: true,
+    });
+    const hidden = () => r.dedupRows.map((row, i) => row.classList.contains('mt-dup-row') ? i : -1).filter((i) => i >= 0);
+
+    t('排重：4k 压过已下载的非4k（SSIS-001 保留 4k 那条）', () => {
+        assert.deepStrictEqual(hidden(), [0, 1, 4, 5],
+            '0/1 是已下载中字与破解（输给4k），4 是 JUR 未下载LTX（输给已下载中字），5 是 MIDE 未下载4k（输给已下载4k），实际：' + hidden());
+    });
+
+    t('排重：已下载的非4k 压过未下载的 LTX（JUR-478 保留已下载那条）', () => {
+        assert.ok(!r.dedupRows[3].classList.contains('mt-dup-row'), '已下载中字应保留');
+        assert.ok(r.dedupRows[4].classList.contains('mt-dup-row'), '未下载 LTX 应被排掉');
+    });
+
+    t('排重：同档位下已下载的 4k 压过未下载的 4k（虽然后出现）', () => {
+        assert.ok(r.dedupRows[5].classList.contains('mt-dup-row'), '排在前面的未下载4k应被排掉');
+        assert.ok(!r.dedupRows[6].classList.contains('mt-dup-row'), '后出现的已下载4k应胜出');
     });
 }
 

@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         M-Team 女优身高标注 + 列表大图
 // @namespace    mteam
-// @version      1.9.0
+// @version      1.9.1
 // @description  在种子列表/详情页的标题与副标题中，女优名字后面追加身高（如「三上悠亜 159cm」）；同时放大列表缩略图（240/360/480 可切换）、种子名完整显示不被省略号截断；并支持收藏当前页面、给已订阅女优加「已订阅」标签。身高数据内嵌，订阅名单只在订阅页点按钮时从页面读取，脚本不发任何网络请求。
 // @author       Cola.Kot
 // @license      MIT
@@ -663,16 +663,20 @@ function extractCode(text) {
     return m ? m[0].toUpperCase() : '';
 }
 
-function versionScore(titleText, subText) {
+// 排重档位：4k+LTX(60) > 4k(50) > 已下载(+5) > LTX(3) > 破解(2) > 中字(1) > 其它(0)
+// 「已下载」加 5 分：能压过同番号的未下载 LTX/破解/中字，但仍压不过 4k 档——
+// 这样已下载的非4k 不会把 4k 版本排掉（用户明确要求），同档位则已下载的胜出。
+function versionScore(titleText, subText, done) {
     const text = (titleText || '') + ' ' + (subText || '');
     const has4k = /4\s*k/i.test(text);
     const hasLtx = /ltx/i.test(text);
-    if (has4k && hasLtx) return 5;
-    if (has4k) return 4;
-    if (hasLtx) return 3;
-    if (/破解/.test(text)) return 2;
-    if (/中字|中文字幕/.test(text)) return 1;
-    return 0;
+    let base = 0;
+    if (has4k && hasLtx) base = 60;
+    else if (has4k) base = 50;
+    else if (hasLtx) base = 3;
+    else if (/破解/.test(text)) base = 2;
+    else if (/中字|中文字幕/.test(text)) base = 1;
+    return base + (done ? 5 : 0);
 }
 
 function injectListViewStyle() {
@@ -759,7 +763,7 @@ function applyListView() {
     injectListViewStyle();
     const groups = listRowGroups();
 
-    // ① 隐藏已订阅：给所在行打类，不删节点（订阅标签还要留在 DOM 里参与匹配）
+    // ① 折叠/隐藏：带「已订阅」标记的行 + 已下载完成的行（一起折叠，避免重复订阅提示）
     const subBadges = document.querySelectorAll('.mt-sub-badge');
     const subRows = (typeof WeakSet === 'function') ? new WeakSet() : null;
     document.querySelectorAll('tr.mt-hide-row').forEach((tr) => tr.classList.remove('mt-hide-row'));
@@ -768,6 +772,19 @@ function applyListView() {
         if (!row) continue;
         if (subRows) subRows.add(row);
         if (hideSubscribed) row.classList.add('mt-hide-row');
+    }
+    if (hideSubscribed) {
+        const doneBars = document.querySelectorAll('.ant-progress');
+        for (let i = 0; i < doneBars.length; i++) {
+            const bar = doneBars[i];
+            // 只认已完成的进度条，避免把下载中/做种中的行也折叠掉
+            const cls = String(bar.getAttribute && bar.getAttribute('class') || '');
+            if (!/ant-progress-status-success/.test(cls) &&
+                String(bar.getAttribute && bar.getAttribute('aria-valuenow') || '') !== '100' &&
+                !(bar.querySelectorAll && bar.querySelectorAll('.anticon-check-circle').length)) continue;
+            const row = bar.closest && bar.closest('tr');
+            if (row) row.classList.add('mt-hide-row');
+        }
     }
 
     // ② 身高排序：只在开着的时候动 DOM，关掉时按记住的原始顺序还原
@@ -811,7 +828,8 @@ function applyListView() {
             const sub = rowSubText(row);
             const code = extractCode(title) || extractCode(sub);
             if (!code) continue;
-            const score = versionScore(title, sub);
+            const done = rowDownloadDone(row);
+            const score = versionScore(title, sub, done);
             const cur = best[code];
             if (!cur) {
                 best[code] = { row, score };
@@ -853,8 +871,8 @@ function refreshListViewUI() {
         hideBtn.textContent = hideSubscribed ? '显示全部' : '隐藏已订阅';
         hideBtn.classList.toggle('mt-on', hideSubscribed);
         hideBtn.title = hideSubscribed
-            ? '当前已隐藏带「已订阅」标记的种子，点此恢复显示'
-            : '隐藏列表中所有带「已订阅」标记的种子';
+            ? '当前已隐藏带「已订阅」标记及已下载完成的种子，点此恢复显示'
+            : '隐藏带「已订阅」标记、以及已下载完成的种子（100% 进度条）';
     }
     const sortBtn = document.querySelector('#mt-height-panel .mt-height-sort-btn');
     if (sortBtn) {
@@ -869,8 +887,8 @@ function refreshListViewUI() {
         dupBtn.textContent = dedupOn ? '恢复重复' : '番号排重';
         dupBtn.classList.toggle('mt-on', dedupOn);
         dupBtn.title = dedupOn
-            ? '同番号只保留版本最优的一条（4k+LTX > 4k > LTX > 破解 > 中字），点此恢复全部显示'
-            : '同一番号的多条种子只留最优版本，隐藏其余（不删除），按标题/副标的版本标记判定';
+            ? '同番号只保留最优的一条（4k+LTX > 4k > 已下载 > LTX > 破解 > 中字），点此恢复全部显示'
+            : '同一番号的多条种子只留最优版本，隐藏其余（不删除）；已下载的优先，但 4k 压过已下载的非4k';
     }
 }
 
